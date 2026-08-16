@@ -210,15 +210,15 @@ __marimo__/
 .DS_Store
 
 # Local ComfyUI configuration and runtime state
-model_paths.yaml
-comfyui*.yaml
-comfyui*.json
-custom_nodes_cache/
-user/
-models/
-output/
-temp/
-input/
+/model_paths.yaml
+/comfyui*.yaml
+/comfyui*.json
+/custom_nodes_cache/
+/user/
+/models/
+/output/
+/temp/
+/input/
 
 # CUDA/Triton and accelerator caches
 .triton/

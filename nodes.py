@@ -3,13 +3,14 @@
 """
 FlashVSR ComfyUI Node - Video Super Resolution
 ===============================================
-Supports 5 VAE models: Wan2.1, Wan2.2, LightVAE_W2.1, TAE_W2.2, LightTAE_HY1.5
+Supports the VAE implementations that are bundled and validated in this repo:
+Wan2.1 and LightVAE_W2.1.
 
 Key Fixes Applied:
-- FIX 1: Merged VAE selection into single 'vae_model' dropdown (5 options)
+- FIX 1: Merged VAE selection into a single validated 'vae_model' dropdown
 - FIX 2: STRICT file path mapping - each VAE loads its own distinct file
 - FIX 3: Black border fix - crop ONLY AFTER full VAE decode is complete
-- FIX 4: Lossless resize uses NEAREST for integer scaling
+- FIX 4: Quality-preserving resize and crop semantics match the reference path
 - FIX 5: VRAM optimization - 95% threshold before triggering OOM recovery
 - FIX 6: Auto-download with CORRECT HuggingFace URLs
 - FIX 7: Explicit VAE class instantiation - no guessing from state_dict
@@ -35,19 +36,19 @@ from huggingface_hub import snapshot_download, hf_hub_download
 try:
     from .src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
     from .src.models.TCDecoder import build_tcdecoder
-    from .src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
+    from .src.models.utils import clean_vram, get_device_list, load_state_dict, normalize_checkpoint_state_dict, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
     from .src.models.wan_video_dit import ATTENTION_MODES, attention_backend_status
     from .src.models.wan_video_vae import (
-        WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae,
+        WanVideoVAE, LightX2VVAE, create_video_vae,
         VAE_FULL_DIM, VAE_LIGHT_DIM, VAE_Z_DIM
     )
 except ImportError:
     from src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
     from src.models.TCDecoder import build_tcdecoder
-    from src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
+    from src.models.utils import clean_vram, get_device_list, load_state_dict, normalize_checkpoint_state_dict, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
     from src.models.wan_video_dit import ATTENTION_MODES, attention_backend_status
     from src.models.wan_video_vae import (
-        WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae,
+        WanVideoVAE, LightX2VVAE, create_video_vae,
         VAE_FULL_DIM, VAE_LIGHT_DIM, VAE_Z_DIM
     )
 
@@ -57,9 +58,10 @@ except ImportError:
     pass
 
 # =============================================================================
-# FIX 1: Unified VAE model selection dropdown - ALL 5 OPTIONS
+# Decoder and quality options
 # =============================================================================
-VAE_MODEL_OPTIONS = ["Wan2.1", "Wan2.2", "LightVAE_W2.1", "TAE_W2.2", "LightTAE_HY1.5"]
+VAE_MODEL_OPTIONS = ["Wan2.1", "LightVAE_W2.1"]
+FIX_METHOD_OPTIONS = ["wavelet", "adain"]
 ATTENTION_MODE_OPTIONS = list(ATTENTION_MODES)
 
 # =============================================================================
@@ -76,15 +78,6 @@ VAE_MODEL_MAP = {
         "z_dim": VAE_Z_DIM,
         "use_full_arch": False
     },
-    "Wan2.2": {
-        "class": Wan22VideoVAE, 
-        "file": "Wan2.2_VAE.pth",
-        "internal_name": "wan2.2",
-        "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/Wan2.2_VAE.pth",
-        "dim": VAE_FULL_DIM,
-        "z_dim": VAE_Z_DIM,
-        "use_full_arch": False
-    },
     "LightVAE_W2.1": {
         "class": LightX2VVAE, 
         "file": "lightvaew2_1.pth",
@@ -92,25 +85,7 @@ VAE_MODEL_MAP = {
         "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/lightvaew2_1.pth",
         "dim": VAE_LIGHT_DIM,
         "z_dim": VAE_Z_DIM,
-        "use_full_arch": True
-    },
-    "TAE_W2.2": {
-        "class": Wan22VideoVAE,  # TAE uses same base as Wan2.2
-        "file": "taew2_2.safetensors",
-        "internal_name": "tae_w2.2",
-        "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/taew2_2.safetensors",
-        "dim": VAE_FULL_DIM,
-        "z_dim": VAE_Z_DIM,
         "use_full_arch": False
-    },
-    "LightTAE_HY1.5": {
-        "class": LightX2VVAE,  # LightTAE uses LightX2V architecture
-        "file": "lighttaehy1_5.pth",
-        "internal_name": "lighttae_hy1.5",
-        "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/lighttaehy1_5.pth",
-        "dim": VAE_LIGHT_DIM,
-        "z_dim": VAE_Z_DIM,
-        "use_full_arch": True
     },
 }
 
@@ -198,12 +173,18 @@ def log(message: str, message_type: str = 'normal', icon: str = "", end: str = "
     else:
         message = message
 
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        message.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        message = message.encode(encoding, errors="replace").decode(encoding, errors="replace")
+
     if in_place:
         # Clear line before printing
         sys.stdout.write("\r\033[K" + message)
         sys.stdout.flush()
     else:
-        print(f"{message}", end=end, flush=True)
+        print(message, end=end, flush=True)
 
 def get_vram_info():
     if torch.cuda.is_available():
@@ -324,52 +305,39 @@ def get_optimal_settings(width, height, num_frames, scale, available_vram_gb, mo
         # Settings are fine
         return recommended
     
-    # Try enabling tiled VAE first (least impact on quality)
-    estimated_tiled_vae = estimate_vram_usage(width, height, num_frames, scale,
-                                               tiled_vae=True, tiled_dit=False,
-                                               chunk_size=0, mode=mode)
-    if estimated_tiled_vae <= target_vram:
-        recommended["tiled_vae"] = True
-        return recommended
-    
-    # Try enabling both tiling
-    estimated_both_tiled = estimate_vram_usage(width, height, num_frames, scale,
-                                                tiled_vae=True, tiled_dit=True,
-                                                chunk_size=0, mode=mode)
-    if estimated_both_tiled <= target_vram:
-        recommended["tiled_vae"] = True
-        recommended["tiled_dit"] = True
-        return recommended
-    
-    # Need chunking - find optimal chunk size
-    recommended["tiled_vae"] = True
-    recommended["tiled_dit"] = True
-    
-    for chunk in [100, 64, 32, 16, 8, 4]:
-        if chunk >= num_frames:
-            continue
-        estimated_chunked = estimate_vram_usage(width, height, num_frames, scale,
-                                                 tiled_vae=True, tiled_dit=True,
-                                                 chunk_size=chunk, mode=mode)
-        if estimated_chunked <= target_vram:
-            recommended["chunk_size"] = chunk
+    # Only the Full Wan VAE has a quality-preserving, decoder-native tiler.
+    # Tiny modes use TCDecoder and must not be spatially sliced.
+    use_tiled_vae = mode == "full"
+    if use_tiled_vae:
+        estimated_tiled_vae = estimate_vram_usage(
+            width, height, num_frames, scale,
+            tiled_vae=True, tiled_dit=False,
+            chunk_size=0, mode=mode,
+        )
+        if estimated_tiled_vae <= target_vram:
+            recommended["tiled_vae"] = True
             return recommended
-    
-    # Still too high - recommend resize factor
+
+    # External temporal chunking resets model state, and DiT spatial tiling
+    # changes the model's global attention context. Prefer a lower working
+    # resolution over silently changing inference semantics.
     for resize in [0.8, 0.6, 0.5, 0.4, 0.3]:
         new_h, new_w = int(height * resize), int(width * resize)
         estimated_resized = estimate_vram_usage(new_w, new_h, num_frames, scale,
-                                                 tiled_vae=True, tiled_dit=True,
-                                                 chunk_size=8, mode=mode)
+                                                 tiled_vae=use_tiled_vae, tiled_dit=False,
+                                                 chunk_size=0, mode=mode)
         if estimated_resized <= target_vram:
-            recommended["chunk_size"] = 8
+            recommended["tiled_vae"] = use_tiled_vae
             recommended["resize_factor"] = resize
             return recommended
-    
+
     # Even with max reduction still risky
-    recommended["chunk_size"] = 4
+    recommended["tiled_vae"] = use_tiled_vae
     recommended["resize_factor"] = 0.3
-    recommended["warning"] = "VRAM critically low. Results may be unstable."
+    recommended["warning"] = (
+        "VRAM is critically low. Use Tiny-Long or a lower input resolution; "
+        "quality-changing DiT/chunk fallbacks are intentionally disabled."
+    )
     return recommended
 
 
@@ -517,7 +485,14 @@ def log_vram_advisory(width, height, num_frames, scale, tiled_vae, tiled_dit, mo
         message_type='info', icon="💡")
     
     if estimated_vram > free_vram * 0.9:
-        log("⚠️ Warning: High VRAM usage expected. Recommend enabling Tiled VAE/DiT.", message_type='warning', icon="⚠️")
+        if mode == "full" and not tiled_vae:
+            recommendation = "Enable the Wan VAE's native tiler or reduce the working resolution."
+        else:
+            recommendation = "Reduce the working resolution or use Tiny-Long."
+        log(
+            f"High VRAM usage expected. {recommendation}",
+            message_type='warning', icon="⚠️",
+        )
     elif estimated_vram < free_vram * 0.5:
         log("✅ Safe to proceed. VRAM usage should be comfortable.", message_type='info', icon="✅")
 
@@ -636,55 +611,61 @@ def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: i
     =============================================================================
     FIX 3: Black Border Fix - Track original scaled dimensions
     =============================================================================
-    Returns: sW, sH (actual scaled), tW, tH (padded to multiple), pad_left, pad_top
+    Returns: sW, sH (scaled), tW, tH (model size), crop_left, crop_top.
+
+    FlashVSR's reference path crops the scaled image to the largest valid
+    multiple instead of reflecting pixels into the model context.  For inputs
+    smaller than one model block we keep a single block and use edge padding as
+    a robustness fallback.
     """
     if w0 <= 0 or h0 <= 0:
         raise ValueError("invalid original size")
 
     sW, sH = w0 * scale, h0 * scale
-    tW = math.ceil(sW / multiple) * multiple
-    tH = math.ceil(sH / multiple) * multiple
-    
-    # Calculate padding offsets (centered padding)
-    pad_left = (tW - sW) // 2
-    pad_top = (tH - sH) // 2
-    
-    return sW, sH, tW, tH, pad_left, pad_top
+    tW = max(multiple, (sW // multiple) * multiple)
+    tH = max(multiple, (sH // multiple) * multiple)
+    if sW < multiple:
+        tW = multiple
+    if sH < multiple:
+        tH = multiple
+
+    crop_left = max(0, (sW - tW) // 2)
+    crop_top = max(0, (sH - tH) // 2)
+    return sW, sH, tW, tH, crop_left, crop_top
 
 
-def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int, pad_left: int, pad_top: int) -> torch.Tensor:
+def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int, crop_left: int, crop_top: int) -> torch.Tensor:
     """
-    Upscale frame tensor and pad to target dimensions.
-    
-    =============================================================================
-    FIX 3: Black Border Fix - Use consistent padding offsets
-    =============================================================================
+    Upscale, then center-crop to the official model dimensions.
     """
     h0, w0, c = frame_tensor.shape
     tensor_bchw = frame_tensor.permute(2, 0, 1).unsqueeze(0) # HWC -> CHW -> BCHW
     
     sW, sH = w0 * scale, h0 * scale
-    upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode='bicubic', align_corners=False)
-    
-    # Apply symmetric padding to reach target dimensions
-    if sW < tW or sH < tH:
-        pad_r = tW - sW - pad_left
-        pad_b = tH - sH - pad_top
-        # Pad order: (left, right, top, bottom)
-        # Use 'replicate' mode which is safer for small images than 'reflect'
-        # (reflect requires image size >= padding size on each dimension)
-        max_pad = max(pad_left, pad_r, pad_top, pad_b)
-        min_dim = min(upscaled_tensor.shape[2], upscaled_tensor.shape[3])
-        if min_dim >= max_pad:
-            upscaled_tensor = F.pad(upscaled_tensor, (pad_left, pad_r, pad_top, pad_b), mode='reflect')
-        else:
-            # Fall back to replicate mode for small images
-            upscaled_tensor = F.pad(upscaled_tensor, (pad_left, pad_r, pad_top, pad_b), mode='replicate')
-    
-    # Center crop to target dimensions if needed (should be exact after padding)
-    l = max(0, (upscaled_tensor.shape[3] - tW) // 2)
-    t = max(0, (upscaled_tensor.shape[2] - tH) // 2)
-    cropped_tensor = upscaled_tensor[:, :, t:t + tH, l:l + tW]
+    upscaled_tensor = F.interpolate(
+        tensor_bchw,
+        size=(sH, sW),
+        mode='bicubic',
+        align_corners=False,
+        antialias=True,
+    ).clamp_(0.0, 1.0)
+
+    # Tiny inputs can be smaller than one model block. Replicate padding is a
+    # bounded fallback; normal-sized inputs use a pure center crop.
+    pad_left = max(0, (tW - sW) // 2)
+    pad_right = max(0, tW - sW - pad_left)
+    pad_top = max(0, (tH - sH) // 2)
+    pad_bottom = max(0, tH - sH - pad_top)
+    if pad_left or pad_right or pad_top or pad_bottom:
+        upscaled_tensor = F.pad(
+            upscaled_tensor,
+            (pad_left, pad_right, pad_top, pad_bottom),
+            mode='replicate',
+        )
+
+    cropped_tensor = upscaled_tensor[
+        :, :, crop_top:crop_top + tH, crop_left:crop_left + tW
+    ]
 
     return cropped_tensor.squeeze(0)
 
@@ -696,12 +677,22 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     =============================================================================
     FIX 3: Black Border Fix - Track padding for later cropping
     =============================================================================
-    Returns: vid_final, tH, tW, F, original_sH, original_sW, pad_top, pad_left
+    Returns: vid_final, tH, tW, F, output_H, output_W, crop_top, crop_left
     """
-    N0, h0, w0, _ = image_tensor.shape
+    if image_tensor.ndim != 4:
+        raise ValueError(
+            f"FlashVSR input must have shape (frames, height, width, channels), got {tuple(image_tensor.shape)}."
+        )
+    N0, h0, w0, channels = image_tensor.shape
+    if N0 < 1:
+        raise ValueError("FlashVSR requires at least one input frame.")
+    if channels != 3:
+        raise ValueError(f"FlashVSR requires RGB input with 3 channels, got {channels}.")
     
     multiple = 128 # Keep 128 alignment for VAE/DiT blocks
-    sW, sH, tW, tH, pad_left, pad_top = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
+    sW, sH, tW, tH, crop_left, crop_top = compute_scaled_and_target_dims(
+        w0, h0, scale=scale, multiple=multiple
+    )
     num_frames_with_padding = N0 + 4
     F = largest_8n1_leq(num_frames_with_padding)
     
@@ -713,8 +704,12 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
         tensor_chw = tensor_upscale_then_center_crop(
-            frame_slice, scale=scale, tW=tW, tH=tH, 
-            pad_left=pad_left, pad_top=pad_top
+            frame_slice,
+            scale=scale,
+            tW=tW,
+            tH=tH,
+            crop_left=crop_left,
+            crop_top=crop_top,
         ).to('cpu').to(dtype) * 2.0 - 1.0
         frames.append(tensor_chw)
         del frame_slice
@@ -725,8 +720,9 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     del vid_stacked
     clean_vram()
     
-    # Return additional info for cropping output back to original dimensions
-    return vid_final, tH, tW, F, sH, sW, pad_top, pad_left
+    # The model sees the official cropped dimensions, so its output should be
+    # consumed at tH/tW without trying to reinsert reflected padding.
+    return vid_final, tH, tW, F, tH, tW, 0, 0
 
 def calculate_tile_coords(height, width, tile_size, overlap):
     coords = []
@@ -752,16 +748,22 @@ def calculate_tile_coords(height, width, tile_size, overlap):
             
     return coords
 
-def create_feather_mask(size, overlap):
+def create_feather_mask(size, overlap, fade_left=True, fade_right=True, fade_top=True, fade_bottom=True):
     H, W = size
     mask = torch.ones(1, 1, H, W)
+    overlap = max(0, min(int(overlap), H // 2, W // 2))
+    if overlap == 0:
+        return mask
+
     ramp = torch.linspace(0, 1, overlap)
-    
-    mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
-    mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
-    
-    mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
-    mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
+    if fade_left:
+        mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
+    if fade_right:
+        mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
+    if fade_top:
+        mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
+    if fade_bottom:
+        mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
     
     return mask
 
@@ -772,134 +774,185 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", attention_mode
     =============================================================================
     FIX 2 & 7: STRICT VAE file path mapping with EXPLICIT class instantiation
     =============================================================================
-    - vae_model: Unified VAE selection from dropdown (5 options)
-    - Each VAE selection loads a DISTINCT file (no file reuse)
-    - EXPLICIT class instantiation based on selection - NO guessing from state_dict
-    
-    File Mapping:
-    - "Wan2.1" -> Wan2.1_VAE.pth -> WanVideoVAE
-    - "Wan2.2" -> Wan2.2_VAE.pth -> Wan22VideoVAE
-    - "LightVAE_W2.1" -> lightvaew2_1.pth -> LightX2VVAE
-    - "TAE_W2.2" -> taew2_2.safetensors -> Wan22VideoVAE
-    - "LightTAE_HY1.5" -> lighttaehy1_5.pth -> LightX2VVAE
+    Full mode uses the selected, validated Wan VAE. Tiny and Tiny-Long use
+    TCDecoder by design and do not download or instantiate an unused VAE.
     """
+    if mode == "full" and vae_model not in VAE_MODEL_MAP:
+        if vae_model == "Wan2.2":
+            raise ValueError(
+                "Official Wan2.2 VAE is incompatible with FlashVSR: it uses "
+                "48-channel latents at 16x spatial compression, while the "
+                "FlashVSR DiT produces 16-channel latents at 8x compression."
+            )
+        raise ValueError(
+            f"Unsupported VAE '{vae_model}'. Supported Full decoders: "
+            f"{', '.join(VAE_MODEL_OPTIONS)}"
+        )
+
     model_download(model_name="JunhaoZhuang/"+model)
     base_dir = get_flashvsr_model_base_dir()
     model_path = os.path.join(base_dir, model)
     if not os.path.exists(model_path):
         raise RuntimeError(f'Model directory does not exist!\nPlease save all weights to "{model_path}"')
-    ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
-    if not os.path.exists(ckpt_path):
-        raise RuntimeError(f'"diffusion_pytorch_model_streaming_dmd.safetensors" does not exist!\nPlease save it to "{model_path}"')
-    
-    # ==========================================================================
-    # FIX 2 & 7: VAE Model Loading - EXPLICIT mapping (no guessing!)
-    # ==========================================================================
-    if vae_model not in VAE_MODEL_MAP:
-        log(f"Unknown VAE model '{vae_model}', defaulting to Wan2.1", message_type='warning', icon="⚠️")
-        vae_model = "Wan2.1"
-    
-    vae_config = VAE_MODEL_MAP[vae_model]
-    vae_class = vae_config["class"]
-    vae_file = vae_config["file"]
-    vae_dim = vae_config["dim"]
-    vae_z_dim = vae_config["z_dim"]
-    use_full_arch = vae_config["use_full_arch"]
-    
-    # Debug logging - Show EXACTLY which file and class will be used
-    log(f"VAE Selection: '{vae_model}' -> File: '{vae_file}' -> Class: {vae_class.__name__}", 
-        message_type='info', icon="🔍")
-    
-    # ==========================================================================
-    # FIX 6: Auto-download VAE if missing
-    # ==========================================================================
-    vae_path = download_vae_if_missing(vae_file, model_path, vae_config)
-    
-    log(f"VAE file path confirmed: {vae_path}", message_type='info', icon="📁")
-    
-    lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
-    if not os.path.exists(lq_path):
-        raise RuntimeError(f'"LQ_proj_in.ckpt" does not exist!\nPlease save it to "{model_path}"')
-    tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
-    if not os.path.exists(tcd_path):
-        raise RuntimeError(f'"TCDecoder.ckpt" does not exist!\nPlease save it to "{model_path}"')
+    def first_existing(candidates, label):
+        for filename in candidates:
+            candidate = os.path.join(model_path, filename)
+            if os.path.exists(candidate):
+                return candidate
+        raise RuntimeError(
+            f"{label} does not exist in '{model_path}'. Tried: {', '.join(candidates)}"
+        )
+
+    if model == "FlashVSR-v1.1":
+        ckpt_candidates = [
+            "diffusion_pytorch_model_streaming_dmd_v11.safetensors",
+            "diffusion_pytorch_model_streaming_dmd.safetensors",
+        ]
+        lq_candidates = ["LQ_proj_in_v11.ckpt", "LQ_proj_in.ckpt"]
+    else:
+        ckpt_candidates = ["diffusion_pytorch_model_streaming_dmd.safetensors"]
+        lq_candidates = ["LQ_proj_in.ckpt"]
+
+    ckpt_path = first_existing(ckpt_candidates, "DiT checkpoint")
+    lq_path = first_existing(lq_candidates, "LQ projection checkpoint")
+    tcd_path = None
+    if mode != "full":
+        tcd_path = first_existing(["TCDecoder.ckpt"], "TCDecoder checkpoint")
+
+    vae_config = None
+    vae_path = None
+    if mode == "full":
+        vae_config = VAE_MODEL_MAP[vae_model]
+        vae_path = download_vae_if_missing(vae_config["file"], model_path, vae_config)
+        log(
+            f"Full decoder: '{vae_model}' -> '{vae_config['file']}' -> "
+            f"{vae_config['class'].__name__}",
+            message_type='info', icon="🔍",
+        )
+    else:
+        log(
+            f"Mode '{mode}' uses TCDecoder; VAE selection '{vae_model}' is not loaded.",
+            message_type='info', icon="📦",
+        )
+
+    log(f"DiT checkpoint: {os.path.basename(ckpt_path)}", message_type='info', icon="📁")
+    log(f"LQ projection: {os.path.basename(lq_path)}", message_type='info', icon="📁")
     current_dir = os.path.dirname(os.path.abspath(__file__))
     prompt_path = os.path.join(current_dir, "posi_prompt.pth")
-    
-    mm = ModelManager(torch_dtype=dtype, device="cpu")
-    if mode == "full":
-        mm.load_models([ckpt_path, vae_path])
-        pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
 
-        # =======================================================================
-        # FIX 7: EXPLICIT VAE class instantiation - NO guessing from state_dict
-        # =======================================================================
-        log(f"Creating EXPLICIT VAE instance: {vae_class.__name__} (dim={vae_dim}, z_dim={vae_z_dim})", 
-            message_type='info', icon="📦")
-        
-        # Load weights from file
-        if vae_path.endswith(".safetensors"):
-            try:
-                import safetensors.torch
-                sd = safetensors.torch.load_file(vae_path)
-            except ImportError:
-                raise RuntimeError("safetensors library required to load .safetensors VAE file.")
-        else:
-            sd = torch.load(vae_path, map_location="cpu", weights_only=False)
-        
-        # EXPLICIT class instantiation based on user selection (FIX 7)
-        # NO state_dict inspection - we trust the user's selection
-        if vae_class == LightX2VVAE:
-            pipe.vae = LightX2VVAE(z_dim=vae_z_dim, dim=vae_dim, use_full_arch=use_full_arch)
-        elif vae_class == Wan22VideoVAE:
-            pipe.vae = Wan22VideoVAE(z_dim=vae_z_dim, dim=vae_dim)
-        else:  # WanVideoVAE (default)
-            pipe.vae = WanVideoVAE(z_dim=vae_z_dim, dim=vae_dim)
-        
-        # Load state dict with logging for missing/unexpected keys
-        load_result = pipe.vae.load_state_dict(sd, strict=False)
+    def load_full_vae(config, checkpoint_path):
+        vae_class = config["class"]
+        init_kwargs = {
+            "z_dim": config["z_dim"],
+            "dim": config["dim"],
+        }
+        if vae_class is LightX2VVAE:
+            init_kwargs["use_full_arch"] = config["use_full_arch"]
+
+        vae = vae_class(**init_kwargs).eval().requires_grad_(False)
+        raw_state = load_state_dict(checkpoint_path)
+        target_state = vae.state_dict()
+        vae_state = normalize_checkpoint_state_dict(raw_state, target_state)
+        missing = sorted(set(target_state) - set(vae_state))
+        unexpected = sorted(set(vae_state) - set(target_state))
+        mismatched = [
+            (key, tuple(vae_state[key].shape), tuple(target_state[key].shape))
+            for key in sorted(set(target_state).intersection(vae_state))
+            if tuple(vae_state[key].shape) != tuple(target_state[key].shape)
+        ]
+        if missing or unexpected or mismatched:
+            details = []
+            if missing:
+                details.append(f"missing={missing[:8]}" + ("..." if len(missing) > 8 else ""))
+            if unexpected:
+                details.append(f"unexpected={unexpected[:8]}" + ("..." if len(unexpected) > 8 else ""))
+            if mismatched:
+                details.append(f"shape_mismatch={mismatched[:4]}" + ("..." if len(mismatched) > 4 else ""))
+            raise RuntimeError(
+                f"VAE '{vae_model}' does not match {os.path.basename(checkpoint_path)}: "
+                + "; ".join(details)
+            )
+        vae.load_state_dict(vae_state, strict=True, assign=True)
+        return vae.to(device="cpu", dtype=dtype)
+
+    def load_tcdecoder(checkpoint_path):
+        decoder = build_tcdecoder(
+            new_channels=[512, 256, 128, 128],
+            device=device,
+            dtype=dtype,
+            new_latent_channels=16 + 768,
+        )
+        state = load_state_dict(checkpoint_path)
+        target_state = decoder.state_dict()
+        state = normalize_checkpoint_state_dict(state, target_state)
+        mismatched = [
+            (key, tuple(state[key].shape), tuple(target_state[key].shape))
+            for key in sorted(set(target_state).intersection(state))
+            if tuple(state[key].shape) != tuple(target_state[key].shape)
+        ]
+        if mismatched:
+            raise RuntimeError(
+                f"TCDecoder checkpoint has incompatible tensor shapes: {mismatched[:4]}"
+                + ("..." if len(mismatched) > 4 else "")
+            )
+
+        load_result = decoder.load_state_dict(state, strict=False)
         if load_result.missing_keys:
-            log(f"VAE missing keys: {len(load_result.missing_keys)} (expected for Light* models)", 
-                message_type='info', icon="ℹ️")
+            missing = list(load_result.missing_keys)
+            raise RuntimeError(
+                f"TCDecoder checkpoint is missing required weights: {missing[:8]}"
+                + ("..." if len(missing) > 8 else "")
+            )
         if load_result.unexpected_keys:
-            log(f"VAE unexpected keys: {len(load_result.unexpected_keys)}", 
-                message_type='info', icon="ℹ️")
-        
-        pipe.vae = pipe.vae.to(device=device, dtype=dtype)
-        
+            log(
+                f"TCDecoder ignored {len(load_result.unexpected_keys)} unused checkpoint keys.",
+                message_type='warning', icon="⚠️",
+            )
+        decoder.eval().requires_grad_(False)
+        decoder.clean_mem()
+        return decoder
+
+    mm = ModelManager(torch_dtype=dtype, device="cpu")
+    mm.load_models([ckpt_path])
+    if mode == "full":
+        pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
+        pipe.vae = load_full_vae(vae_config, vae_path)
+        pipe.set_decoder_mode("vae")
         log(f"Loaded VAE weights from: {vae_path}", message_type='info', icon="✅")
         log(f"VAE Type Active: {type(pipe.vae).__name__}", message_type='info', icon="📦")
 
-        pipe.vae.model.encoder = None
-        pipe.vae.model.conv1 = None
-        
-        # =======================================================================
-        # FIX: Load TCDecoder for Full Mode (official FlashVSR approach)
-        # The official FlashVSR uses TCDecoder for all modes with LQ conditioning.
-        # This is critical because TCDecoder.decode_video() takes a `cond` parameter
-        # that enables proper video super-resolution with low-quality guidance.
-        # =======================================================================
-        multi_scale_channels = [512, 256, 128, 128]
-        pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
-        mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device, weights_only=False), strict=False)
-        pipe.TCDecoder.clean_mem()
-        log(f"Loaded TCDecoder for Full Mode (official FlashVSR approach)", message_type='info', icon="✅")
+        if hasattr(pipe.vae, "model"):
+            if hasattr(pipe.vae.model, "encoder"):
+                pipe.vae.model.encoder = None
+            if hasattr(pipe.vae.model, "conv1"):
+                pipe.vae.model.conv1 = None
     else:
-        mm.load_models([ckpt_path])
         if mode == "tiny":
             pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device)
-        else:
+        elif mode == "tiny-long":
             pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device=device)
-        multi_scale_channels = [512, 256, 128, 128]
-        pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
-        mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device, weights_only=False), strict=False)
-        pipe.TCDecoder.clean_mem()
+        else:
+            raise ValueError("mode must be one of: tiny, tiny-long, full")
+        pipe.model_names = ["dit"]
+        pipe.TCDecoder = load_tcdecoder(tcd_path)
+        log(f"Loaded TCDecoder weights from: {tcd_path}", message_type='info', icon="✅")
+
+    if pipe.denoising_model() is None:
+        raise RuntimeError(f"Unable to load DiT checkpoint: {ckpt_path}")
 
     effective_attention_mode = pipe.denoising_model().set_attention_mode(attention_mode)
     pipe.attention_mode = effective_attention_mode
-    if effective_attention_mode != attention_mode:
+    requested_attention_mode = getattr(
+        pipe.denoising_model(), "requested_attention_mode", attention_mode
+    )
+    if requested_attention_mode == "auto":
         log(
-            f"Attention backend '{attention_mode}' is unavailable; using '{effective_attention_mode}'.",
+            f"Auto attention selected '{effective_attention_mode}'.",
+            message_type='info', icon="🧩",
+        )
+    elif effective_attention_mode != requested_attention_mode:
+        log(
+            f"Attention backend '{requested_attention_mode}' is unavailable; using '{effective_attention_mode}'.",
             message_type='warning', icon="⚠️")
     backend_status = attention_backend_status()
     log(
@@ -920,11 +973,11 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", attention_mode
     pipe.to(device, dtype=dtype)
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(prompt_path=prompt_path)
-    pipe.load_models_to_device(["dit","vae"])
+    pipe.load_models_to_device(["dit", "vae"] if mode == "full" else ["dit"])
     pipe.offload_model()
 
     # Log final pipeline info with VAE confirmation
-    vae_info = f"VAE Model: {vae_model}"
+    vae_info = f"VAE Model: {vae_model}" if mode == "full" else "Decoder: TCDecoder"
     if hasattr(pipe, 'vae') and pipe.vae is not None:
         vae_info += f" ({type(pipe.vae).__name__})"
     
@@ -1018,7 +1071,7 @@ class cqdm:
     def __len__(self):
         return self.total
 
-def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug, is_single_frame_input=False):
+def process_chunk(pipe, frames, scale, color_fix, fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug, is_single_frame_input=False):
     """
     Processes a single chunk of frames.
     
@@ -1034,6 +1087,12 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
     _frames = frames
     _device = pipe.device
     dtype = pipe.torch_dtype
+    denoising_model = pipe.denoising_model()
+    requested_attention_mode = getattr(
+        denoising_model,
+        "requested_attention_mode",
+        getattr(pipe, "attention_mode", None),
+    )
     
     # Store original dimensions for cropping (FIX 3)
     original_H, original_W = frames.shape[1], frames.shape[2]
@@ -1049,7 +1108,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         
         final_output_canvas = torch.zeros(
             (N, H * scale, W * scale, C), 
-            dtype=torch.float16, 
+            dtype=torch.float32,
             device="cpu"
         )
         weight_sum_canvas = torch.zeros_like(final_output_canvas)
@@ -1080,7 +1139,9 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
                 prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
                 progress_bar_cmd=cqdm_tile, LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                 topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-                color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload,
+                color_fix=color_fix, fix_method=fix_method,
+                attention_mode=requested_attention_mode,
+                unload_dit=unload_dit, force_offload=force_offload,
                 enable_debug_logging=enable_debug
             )
             
@@ -1106,7 +1167,11 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             
             mask_nchw = create_feather_mask(
                 (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
-                tile_overlap * scale
+                tile_overlap * scale,
+                fade_left=x1 > 0,
+                fade_right=x2 < W,
+                fade_top=y1 > 0,
+                fade_bottom=y2 < H,
             ).to("cpu")
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
             out_x1, out_y1 = x1 * scale, y1 * scale
@@ -1146,7 +1211,9 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
             progress_bar_cmd=cqdm_debug, LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
             topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-            color_fix = color_fix, unload_dit=unload_dit, force_offload=force_offload,
+            color_fix=color_fix, fix_method=fix_method,
+            attention_mode=requested_attention_mode,
+            unload_dit=unload_dit, force_offload=force_offload,
             enable_debug_logging=enable_debug
         )
 
@@ -1174,33 +1241,53 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             torch.cuda.empty_cache()
 
     if is_single_frame_input and frames.shape[0] == 1:
-        if frames.shape[0] == 1:
-            final_output = final_output.to("cpu")
-            stacked_image_tensor = torch.median(final_output, dim=0).values.unsqueeze(0).float()
-            del final_output
-            clean_vram()
-            return stacked_image_tensor
+        # Temporal padding exists only to satisfy the video model. Preserve the
+        # first aligned output frame instead of median-filtering generated detail.
+        return final_output[:1].to("cpu").float()
 
     return final_output[:frames.shape[0], :, :, :]
 
-def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full"):
+def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full", fix_method="wavelet"):
     """
     =============================================================================
     FIX 9 & 10: Unified Processing Pipeline with Pre-Flight Check
     =============================================================================
     
     Main FlashVSR processing function.
-    - FIX 4: Lossless Resize - Use NEAREST for integer scaling factors
+    - FIX 4: Antialiased working-resolution resize and reference-aligned crop
     - FIX 5: VRAM Advisory Logging with 95% threshold
     - FIX 9: Pre-Flight Resource Check before processing
     - FIX 10: Unified processing logic applied across all modes
     """
+    if frames.ndim != 4 or frames.shape[0] < 1:
+        raise ValueError("FlashVSR requires a non-empty IMAGE batch with shape (N, H, W, C).")
+    if scale not in (2, 4):
+        raise ValueError(f"FlashVSR scale must be 2 or 4, got {scale}.")
+    if not 0.0 < resize_factor <= 1.0:
+        raise ValueError(f"resize_factor must be in (0, 1], got {resize_factor}.")
+
     # Aggressive garbage collection (FIX 5)
     clean_vram()
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.ipc_collect()
         torch.cuda.empty_cache()
+
+    if chunk_size > 0:
+        log(
+            "frame_chunk_size is ignored because independent chunks reset temporal "
+            "attention and decoder state. Tiny-Long already streams internally.",
+            message_type='warning', icon="⚠️",
+        )
+        chunk_size = 0
+
+    if tiled_dit:
+        log(
+            "tiled_dit is ignored because running independent spatial DiT tiles "
+            "changes sparse-attention context and introduces seams or repeated detail.",
+            message_type='warning', icon="⚠️",
+        )
+        tiled_dit = False
 
     # ==========================================================================
     # FIX 9: Pre-Flight Resource Check (BEFORE loading heavy models/processing)
@@ -1214,26 +1301,27 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     # (Currently just logs warnings - user can adjust settings manually)
     
     # ==========================================================================
-    # FIX 4: Lossless Resize Factor
-    # Use NEAREST interpolation for integer-like factors, BICUBIC otherwise
+    # Working-resolution resize. Any downscale is lossy, so use antialiased
+    # bicubic consistently instead of treating nearest-neighbor as lossless.
     # ==========================================================================
     if resize_factor < 1.0 and resize_factor > 0:
         log(f"Resizing input by factor {resize_factor}...", message_type='info', icon="📉")
         orig_H, orig_W = frames.shape[1], frames.shape[2]
-        new_H, new_W = int(orig_H * resize_factor), int(orig_W * resize_factor)
-        
-        # Check if resize factor results in integer scaling (lossless possible)
-        is_integer_scale = (orig_H % new_H == 0 and orig_W % new_W == 0) or (resize_factor in [0.5, 0.25, 0.125])
+        new_H = max(1, int(orig_H * resize_factor))
+        new_W = max(1, int(orig_W * resize_factor))
         
         frames_permuted = frames.permute(0, 3, 1, 2)
-        if is_integer_scale:
-            # Use NEAREST for potentially lossless integer downscaling
-            frames_resized = F.interpolate(frames_permuted, size=(new_H, new_W), mode='nearest')
-            log(f"Using NEAREST interpolation (lossless for {resize_factor}x)", message_type='info', icon="🔍")
-        else:
-            # Use BICUBIC for non-integer factors
-            frames_resized = F.interpolate(frames_permuted, size=(new_H, new_W), mode='bicubic', align_corners=False)
-            log(f"Using BICUBIC interpolation for non-integer scaling", message_type='info', icon="🔍")
+        frames_resized = F.interpolate(
+            frames_permuted,
+            size=(new_H, new_W),
+            mode='bicubic',
+            align_corners=False,
+            antialias=True,
+        )
+        log(
+            "Using antialiased BICUBIC interpolation; reduced resolution is lossy.",
+            message_type='info', icon="🔍",
+        )
         
         frames = frames_resized.permute(0, 2, 3, 1)  # Back to NHWC
         del frames_permuted, frames_resized
@@ -1276,95 +1364,39 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
 
     # Store input resolution for summary (FIX 8)
     input_resolution = f"{frames.shape[2]}x{frames.shape[1]}"
-    output_resolution = f"{frames.shape[2] * scale}x{frames.shape[1] * scale}"
     
-    # Chunking Logic
-    total_frames = frames.shape[0]
-    final_outputs = []
-
     is_single_frame_input = (frames.shape[0] == 1)
-
-    if chunk_size > 0 and chunk_size < total_frames:
-        num_chunks = math.ceil(total_frames / chunk_size)
-        log(f"Splitting video into {num_chunks} chunks (size {chunk_size})...", message_type='info', icon="✂️")
-
-        for i in range(num_chunks):
-            chunk_start = i * chunk_size
-            chunk_end = min((i + 1) * chunk_size, total_frames)
-
-            if enable_debug:
-                log(f"Processing Chunk {i+1}/{num_chunks}: Frames {chunk_start}-{chunk_end}", message_type='info', icon="🎞️")
-
-            chunk_frames = frames[chunk_start:chunk_end]
-
-            # Auto-Fallback Logic - FIX 5: Uses VRAM_OOM_THRESHOLD (95%)
-            retry_count = 0
-            max_retries = 2
-            current_tiled_vae = tiled_vae
-            current_tiled_dit = tiled_dit
-
-            while retry_count <= max_retries:
-                try:
-                    chunk_out = process_chunk(
-                        pipe, chunk_frames, scale, color_fix, current_tiled_vae, current_tiled_dit,
-                        tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
-                        local_range, seed, force_offload, enable_debug,
-                        is_single_frame_input=is_single_frame_input
-                    )
-                    final_outputs.append(chunk_out.cpu())
-                    del chunk_out
-                    clean_vram()
-                    break # Success
-                except torch.OutOfMemoryError as e:
-                    retry_count += 1
-                    clean_vram()
-                    log(f"OOM detected in Chunk {i+1} (Attempt {retry_count}). Recovering...", message_type='warning', icon="🔄")
-
-                    if not current_tiled_vae:
-                        log("Auto-enabling Tiled VAE to prevent OOM (override)...", message_type='info', icon="🛡️")
-                        current_tiled_vae = True
-                    elif not current_tiled_dit:
-                        log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="🛡️")
-                        current_tiled_dit = True
-                    else:
-                        log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="❌")
-                        raise e # Cannot recover further
-
-        final_output_tensor = torch.cat(final_outputs, dim=0)
-    else:
-        # Auto-Fallback Logic for single chunk/full video
-        retry_count = 0
-        max_retries = 2
-        current_tiled_vae = tiled_vae
-        current_tiled_dit = tiled_dit
-
-        while retry_count <= max_retries:
-            try:
-                final_output_tensor = process_chunk(
-                    pipe, frames, scale, color_fix, current_tiled_vae, current_tiled_dit,
-                    tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
-                    local_range, seed, force_offload, enable_debug,
-                    is_single_frame_input=is_single_frame_input
+    current_tiled_vae = tiled_vae
+    while True:
+        try:
+            final_output_tensor = process_chunk(
+                pipe, frames, scale, color_fix, fix_method,
+                current_tiled_vae, tiled_dit,
+                tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
+                local_range, seed, force_offload, enable_debug,
+                is_single_frame_input=is_single_frame_input,
+            )
+            break
+        except torch.OutOfMemoryError as exc:
+            clean_vram()
+            if mode == "full" and not current_tiled_vae:
+                current_tiled_vae = True
+                log(
+                    "OOM detected; retrying with the Wan VAE's native tiler. "
+                    "DiT spatial tiling remains disabled to preserve model context.",
+                    message_type='warning', icon="🔄",
                 )
-                break
-            except torch.OutOfMemoryError as e:
-                retry_count += 1
-                clean_vram()
-                log(f"OOM detected (Attempt {retry_count}). Recovering...", message_type='warning', icon="🔄")
-
-                if not current_tiled_vae:
-                    log("Auto-enabling Tiled VAE to prevent OOM (override)...", message_type='info', icon="🛡️")
-                    current_tiled_vae = True
-                elif not current_tiled_dit:
-                    log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="🛡️")
-                    current_tiled_dit = True
-                else:
-                    log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="❌")
-                    raise e
+                continue
+            raise RuntimeError(
+                "FlashVSR ran out of VRAM. Reduce resize_factor/input resolution or "
+                "use Tiny-Long. Automatic DiT tiling and stateless frame chunking "
+                "are disabled because they change output quality."
+            ) from exc
 
     end_time = time.time()
     total_time = end_time - start_time
     fps = frames.shape[0] / total_time if total_time > 0 else 0
+    output_resolution = f"{final_output_tensor.shape[2]}x{final_output_tensor.shape[1]}"
     
     # ==========================================================================
     # FIX 8: Summary logging at end of processing
@@ -1400,12 +1432,12 @@ class FlashVSRNodeInitPipe:
                     "tooltip": "Select the FlashVSR model version. V1.1 is recommended for better stability."
                 }),
                 "mode": (["tiny", "tiny-long", "full"], {
-                    "default": "tiny",
-                    "tooltip": 'Operation mode. "tiny": faster, standard memory. "tiny-long": optimized for long videos (lower VRAM). "full": higher quality but max VRAM.'
+                    "default": "full",
+                    "tooltip": 'Operation mode. Tiny modes use TCDecoder for speed. Full uses the selected Wan VAE and provides the highest reconstruction quality.'
                 }),
                 "vae_model": (VAE_MODEL_OPTIONS, {
                     "default": "Wan2.1",
-                    "tooltip": 'VAE model: Wan2.1 (default), Wan2.2, LightVAE_W2.1 (50% less VRAM), TAE_W2.2, LightTAE_HY1.5. Auto-downloads if missing.'
+                    "tooltip": 'Full decoder: Wan2.1 for fidelity or LightVAE_W2.1 for lower VRAM. Official Wan2.2 is incompatible with FlashVSR latent channels. Tiny modes use TCDecoder.'
                 }),
                 "force_offload": ("BOOLEAN", {
                     "default": True,
@@ -1421,7 +1453,7 @@ class FlashVSRNodeInitPipe:
                 }),
                 "attention_mode": (ATTENTION_MODE_OPTIONS, {
                     "default": "auto",
-                    "tooltip": 'Auto selects a GPU-compatible backend. Explicit choices never get replaced by another backend unless initialization or runtime fails.'
+                    "tooltip": 'Auto prefers a mask-capable backend. Dense Sage/FlashAttention choices accelerate compatible calls; masked self-attention uses masked SDPA when required.'
                 }),
             }
         }
@@ -1430,7 +1462,7 @@ class FlashVSRNodeInitPipe:
     RETURN_NAMES = ("pipe",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    DESCRIPTION = 'Initializes the FlashVSR pipeline. 5 VAE options: Wan2.1, Wan2.2, LightVAE_W2.1, TAE_W2.2, LightTAE_HY1.5. Auto-downloads missing files.'
+    DESCRIPTION = 'Initializes FlashVSR with validated attention and decoder backends. Full mode uses the selected Wan VAE; Tiny modes use TCDecoder.'
     
     def main(self, model, mode, vae_model, force_offload, precision, device, attention_mode):
         _device = device
@@ -1489,15 +1521,15 @@ class FlashVSRNodeAdv:
                 }),
                 "color_fix": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Apply wavelet-based color correction to match the output colors with the input, preventing color shifts."
+                    "tooltip": "Match decoded colors to the input using the selected correction method."
                 }),
                 "tiled_vae": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Enable spatial tiling for the VAE decoder. Reduces VRAM usage significantly but is slower. Recommended for high-res outputs."
+                    "default": False,
+                    "tooltip": "Use the Full Wan VAE's native tiler to reduce decode VRAM. Tiny modes ignore this option because TCDecoder spatial tiling changes output quality."
                 }),
                 "tiled_dit": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Enable spatial tiling for the Diffusion Transformer (DiT). Crucial for saving VRAM on large inputs. Disabling it is faster but risky."
+                    "default": False,
+                    "tooltip": "Process the DiT in spatial tiles. This reduces VRAM but changes global attention context, so leave it disabled for best quality."
                 }),
                 "tile_size": ("INT", {
                     "default": 256,
@@ -1526,19 +1558,19 @@ class FlashVSRNodeAdv:
                     "tooltip": "Control for sparse attention. 1.5 is faster, 2.0 is more stable/quality. (For sparse backends only)"
                 }),
                 "kv_ratio": ("FLOAT", {
-                    "default": 3.0,
+                    "default": 3.5,
                     "min": 1.0,
-                    "max": 3.0,
+                    "max": 10.0,
                     "step": 0.1,
                     "display": "slider",
-                    "tooltip": "Key/Value cache ratio. 1.0 uses less VRAM; 3.0 provides highest quality retention."
+                    "tooltip": "Key/Value cache ratio. Higher values preserve more temporal context at the cost of VRAM; 3.5 matches the quality-oriented reference setting."
                 }),
                 "local_range": ("INT", {
                     "default": 11,
-                    "min": 9,
+                    "min": 7,
                     "max": 11,
                     "step": 2,
-                    "tooltip": "Local attention range window. 9 = sharper details; 11 = more stable/consistent results."
+                    "tooltip": "Local sparse-attention window. 11 matches the reference ComfyUI node and favors temporal stability; 9 is sharper."
                 }),
                 "seed": ("INT", {
                     "default": 0,
@@ -1551,7 +1583,7 @@ class FlashVSRNodeAdv:
                     "min": 0,
                     "max": 10000,
                     "step": 1,
-                    "tooltip": "Process video in chunks of N frames to prevent VRAM OOM. 0 = Process all frames at once. Results are merged on CPU."
+                    "tooltip": "Reserved for compatibility. Values above 0 are ignored because independent chunks reset temporal attention and decoder state."
                 }),
                 "enable_debug": ("BOOLEAN", {
                     "default": False,
@@ -1568,6 +1600,10 @@ class FlashVSRNodeAdv:
                     "step": 0.1,
                     "tooltip": "Resize input frames before processing. Set to 0.5x for large 1080p+ videos to save VRAM."
                 }),
+                "fix_method": (FIX_METHOD_OPTIONS, {
+                    "default": "wavelet",
+                    "tooltip": "Color correction method. Wavelet better preserves generated high-frequency detail; AdaIN is a simpler statistical match."
+                }),
             }
         }
     
@@ -1576,16 +1612,23 @@ class FlashVSRNodeAdv:
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
     
-    def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, frame_chunk_size, enable_debug, keep_models_on_cpu, resize_factor):
+    def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, frame_chunk_size, enable_debug, keep_models_on_cpu, resize_factor, fix_method="wavelet"):
         # FIX 10: Extract mode from pipe tuple for unified processing
         # Pipe tuple structure: (pipeline_object, force_offload, mode)
         # Backwards compatible with older 2-element tuples (pipeline, force_offload)
         if len(pipe) >= 3:
-            _pipe, _, mode = pipe
+            _pipe, init_force_offload, mode = pipe
         else:
             _pipe = pipe[0]
+            init_force_offload = bool(pipe[1]) if len(pipe) > 1 else False
             mode = "full"  # Default fallback for backwards compatibility
-        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
+        effective_force_offload = bool(init_force_offload or keep_models_on_cpu)
+        output = flashvsr(
+            _pipe, frames, scale, color_fix, tiled_vae, tiled_dit,
+            tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
+            local_range, seed, effective_force_offload, enable_debug,
+            frame_chunk_size, resize_factor, mode=mode, fix_method=fix_method,
+        )
         return(output.cpu().float(),)
 
 class FlashVSRNode:
@@ -1606,12 +1649,12 @@ class FlashVSRNode:
                     "tooltip": "Select the FlashVSR model version. V1.1 is recommended for better stability."
                 }),
                 "mode": (["tiny", "tiny-long", "full"], {
-                    "default": "tiny",
-                    "tooltip": 'Operation mode. "tiny": faster, standard memory. "tiny-long": optimized for long videos (lower VRAM). "full": higher quality but max VRAM.'
+                    "default": "full",
+                    "tooltip": 'Operation mode. Tiny modes use TCDecoder for speed. Full uses the selected Wan VAE and provides the highest reconstruction quality.'
                 }),
                 "vae_model": (VAE_MODEL_OPTIONS, {
                     "default": "Wan2.1",
-                    "tooltip": 'VAE model: Wan2.1 (default), Wan2.2, LightVAE_W2.1 (50% less VRAM), TAE_W2.2, LightTAE_HY1.5. Auto-downloads if missing.'
+                    "tooltip": 'Full decoder: Wan2.1 for fidelity or LightVAE_W2.1 for lower VRAM. Official Wan2.2 is incompatible with FlashVSR latent channels. Tiny modes use TCDecoder.'
                 }),
                 "scale": ("INT", {
                     "default": 2,
@@ -1620,12 +1663,12 @@ class FlashVSRNode:
                     "tooltip": "Upscaling factor. 2x or 4x."
                 }),
                 "tiled_vae": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Enable spatial tiling for the VAE decoder. Reduces VRAM usage significantly but is slower. Recommended for high-res outputs."
+                    "default": False,
+                    "tooltip": "Use the Full Wan VAE's native tiler to reduce decode VRAM. Tiny modes ignore this option."
                 }),
                 "tiled_dit": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Enable spatial tiling for the Diffusion Transformer (DiT). Crucial for saving VRAM on large inputs."
+                    "default": False,
+                    "tooltip": "Process the DiT in spatial tiles. Leave disabled for best quality because tiling changes global attention context."
                 }),
                 "unload_dit": ("BOOLEAN", {
                     "default": True,
@@ -1642,11 +1685,11 @@ class FlashVSRNode:
                     "min": 0,
                     "max": 10000,
                     "step": 1,
-                    "tooltip": "Process video in chunks of N frames to prevent VRAM OOM. 0 = Process all frames at once."
+                    "tooltip": "Reserved for compatibility. Values above 0 are ignored to preserve temporal attention and decoder state."
                 }),
                 "attention_mode": (ATTENTION_MODE_OPTIONS, {
                     "default": "auto",
-                    "tooltip": 'Auto selects a GPU-compatible backend. SageAttention is optimized for RTX 50 series; SDPA is the safe fallback.'
+                    "tooltip": 'Auto prefers a mask-capable backend. Dense Sage/FlashAttention choices accelerate compatible calls; masked self-attention uses masked SDPA when required.'
                 }),
                 "enable_debug": ("BOOLEAN", {
                     "default": False,
@@ -1663,6 +1706,14 @@ class FlashVSRNode:
                     "step": 0.1,
                     "tooltip": "Resize input frames before processing. Set to 0.5x for large 1080p+ videos to save VRAM."
                 }),
+                "color_fix": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Match output colors to the input after decoding."
+                }),
+                "fix_method": (FIX_METHOD_OPTIONS, {
+                    "default": "wavelet",
+                    "tooltip": "Color correction method. Wavelet better preserves generated high-frequency detail."
+                }),
             }
         }
     
@@ -1670,9 +1721,9 @@ class FlashVSRNode:
     RETURN_NAMES = ("image",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    DESCRIPTION = 'Single-node FlashVSR upscaling. 5 VAE options: Wan2.1, Wan2.2, LightVAE_W2.1, TAE_W2.2, LightTAE_HY1.5. Auto-downloads missing files.'
+    DESCRIPTION = 'Single-node FlashVSR upscaling with quality-oriented BF16, attention, and Wavelet defaults.'
     
-    def main(self, model, frames, mode, vae_model, scale, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu, resize_factor):
+    def main(self, model, frames, mode, vae_model, scale, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu, resize_factor, color_fix=True, fix_method="wavelet"):
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "auto"
         if _device == "auto" or _device not in device_choices:
             raise RuntimeError("No devices found to run FlashVSR!")
@@ -1680,14 +1731,25 @@ class FlashVSRNode:
         if _device.startswith("cuda"):
             torch.cuda.set_device(_device)
             
-        # Use unified vae_model parameter    
+        dtype = (
+            torch.bfloat16
+            if _device.startswith("cuda") and torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
+
+        # Use unified vae_model parameter
         pipe = init_pipeline(
-            model, mode, _device, torch.float16,
+            model, mode, _device, dtype,
             vae_model=vae_model,
             attention_mode=attention_mode,
         )
         # FIX 10: Pass mode for unified processing logic
-        output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
+        output = flashvsr(
+            pipe, frames, scale, color_fix, tiled_vae, tiled_dit,
+            256, 24, unload_dit, 2.0, 3.5, 11, seed,
+            keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor,
+            mode=mode, fix_method=fix_method,
+        )
         return(output.cpu().float(),)
 
 NODE_CLASS_MAPPINGS = {

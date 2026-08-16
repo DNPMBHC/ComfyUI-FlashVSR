@@ -6,17 +6,19 @@
       "frames": {"name": "输入帧", "tooltip": "要放大的视频帧，格式为 IMAGE 批次 (N, H, W, C)。"},
       "model": {"name": "模型", "tooltip": "选择 FlashVSR 模型版本，推荐使用 V1.1 以获得更稳定的结果。"},
       "mode": {"name": "模式", "tooltip": "处理模式：tiny 更快，tiny-long 针对长视频优化，full 优先保证质量。"},
-      "vae_model": {"name": "VAE 模型", "tooltip": "用于解码的 VAE 变体，缺少的 VAE 文件会自动下载。"},
+      "vae_model": {"name": "VAE 模型", "tooltip": "Full 模式可选高保真 Wan2.1 或低显存 LightVAE_W2.1；官方 Wan2.2 使用不兼容的 48 通道潜空间。Tiny 模式固定使用 TCDecoder。"},
       "scale": {"name": "放大倍数", "tooltip": "输出放大倍数：2 倍或 4 倍。"},
-      "tiled_vae": {"name": "分块 VAE", "tooltip": "使用空间分块解码 VAE，以降低显存占用。"},
-      "tiled_dit": {"name": "分块 DiT", "tooltip": "使用空间分块处理扩散 Transformer，以降低显存占用。"},
+      "color_fix": {"name": "颜色修正", "tooltip": "使用所选修正方式，让解码结果的颜色与输入保持一致。"},
+      "fix_method": {"name": "颜色修正方式", "tooltip": "默认使用小波以保留生成结果的高频细节；AdaIN 用于匹配每帧的颜色统计。"},
+      "tiled_vae": {"name": "分块 VAE", "tooltip": "使用 Full 模式 Wan VAE 的原生分块解码以降低显存；Tiny 模式会忽略此选项。"},
+      "tiled_dit": {"name": "分块 DiT（已弃用）", "tooltip": "仅为兼容旧工作流保留，运行时会忽略，因为独立 DiT 分块会降低画质。"},
       "unload_dit": {"name": "卸载 DiT", "tooltip": "VAE 解码前卸载 DiT，以释放显存。"},
       "seed": {"name": "随机种子", "tooltip": "用于生成可复现噪声的随机种子。"},
-      "frame_chunk_size": {"name": "帧分块大小", "tooltip": "每次处理的帧数，0 表示一次处理全部帧。"},
-      "attention_mode": {"name": "注意力后端", "tooltip": "选择注意力后端。自动模式会选择兼容后端，手动选择不会被其他已安装后端替换。"},
+      "frame_chunk_size": {"name": "帧分块大小", "tooltip": "为保证画质，已禁用外部无状态帧分块，非零值会被忽略；长视频请使用 tiny-long 的有状态流式处理。"},
+      "attention_mode": {"name": "注意力后端", "tooltip": "自动模式优先选择支持掩码的后端；Sage/FlashAttention 等稠密后端加速兼容调用，自注意力需要掩码时会用 masked SDPA 保留模型语义。"},
       "enable_debug": {"name": "调试日志", "tooltip": "启用详细的进度、耗时和显存日志。"},
       "keep_models_on_cpu": {"name": "模型保留在 CPU", "tooltip": "将暂时不用的模型保留在 CPU 内存中，以降低显存压力。"},
-      "resize_factor": {"name": "缩放比例", "tooltip": "处理前缩放输入帧，较低的比例可以降低显存占用。"}
+      "resize_factor": {"name": "缩放比例", "tooltip": "最高画质请保持 1.0；降低该值会在超分前丢失原始细节。"}
     },
     "outputs": {
       "0": {"name": "图像", "tooltip": "放大后的视频帧，格式为 IMAGE 批次。"}
@@ -29,20 +31,21 @@
       "pipe": {"name": "处理管线", "tooltip": "由 FlashVSR 初始化管线节点创建的管线对象。"},
       "frames": {"name": "输入帧", "tooltip": "要放大的视频帧，格式为 IMAGE 批次 (N, H, W, C)。"},
       "scale": {"name": "放大倍数", "tooltip": "输出放大倍数：2 倍或 4 倍。"},
-      "color_fix": {"name": "颜色修正", "tooltip": "应用小波颜色修正，减少输出颜色偏移。"},
-      "tiled_vae": {"name": "分块 VAE", "tooltip": "使用空间分块解码 VAE，以降低显存占用。"},
-      "tiled_dit": {"name": "分块 DiT", "tooltip": "使用空间分块处理扩散 Transformer，以降低显存占用。"},
+      "color_fix": {"name": "颜色修正", "tooltip": "使用所选修正方式，让解码结果的颜色与输入保持一致。"},
+      "fix_method": {"name": "颜色修正方式", "tooltip": "默认使用小波以保留生成结果的高频细节；AdaIN 用于匹配每帧的颜色统计。"},
+      "tiled_vae": {"name": "分块 VAE", "tooltip": "使用 Full 模式 Wan VAE 的原生分块解码以降低显存；Tiny 模式会忽略此选项。"},
+      "tiled_dit": {"name": "分块 DiT（已弃用）", "tooltip": "仅为兼容旧工作流保留，运行时会忽略，因为独立 DiT 分块会降低画质。"},
       "tile_size": {"name": "DiT 分块大小", "tooltip": "DiT 处理的空间分块大小。更小的分块占用更少显存，但需要更多处理次数。"},
       "tile_overlap": {"name": "分块重叠", "tooltip": "用于融合分块边界的重叠像素数。"},
       "unload_dit": {"name": "卸载 DiT", "tooltip": "VAE 解码前卸载 DiT，以释放显存。"},
       "sparse_ratio": {"name": "稀疏比例", "tooltip": "稀疏注意力比例。较低值更快，较高值保留更多细节。"},
-      "kv_ratio": {"name": "K/V 比例", "tooltip": "键值缓存比例。较低值占用更少显存。"},
-      "local_range": {"name": "局部范围", "tooltip": "局部注意力窗口大小。"},
+      "kv_ratio": {"name": "K/V 比例", "tooltip": "键值缓存比例范围为 1.0 到 10.0，默认 3.5，用于平衡时序上下文和显存占用。"},
+      "local_range": {"name": "局部范围", "tooltip": "11 与参考 ComfyUI 节点一致并偏向时序稳定，9 更锐利；默认 11。"},
       "seed": {"name": "随机种子", "tooltip": "用于生成可复现噪声的随机种子。"},
-      "frame_chunk_size": {"name": "帧分块大小", "tooltip": "每次处理的帧数，0 表示一次处理全部帧。"},
+      "frame_chunk_size": {"name": "帧分块大小", "tooltip": "为保证画质，已禁用外部无状态帧分块，非零值会被忽略；长视频请使用 tiny-long 的有状态流式处理。"},
       "enable_debug": {"name": "调试日志", "tooltip": "启用详细的进度、耗时和显存日志。"},
       "keep_models_on_cpu": {"name": "模型保留在 CPU", "tooltip": "将暂时不用的模型保留在 CPU 内存中，以降低显存压力。"},
-      "resize_factor": {"name": "缩放比例", "tooltip": "处理前缩放输入帧，较低的比例可以降低显存占用。"}
+      "resize_factor": {"name": "缩放比例", "tooltip": "最高画质请保持 1.0；降低该值会在超分前丢失原始细节。"}
     },
     "outputs": {
       "0": {"name": "图像", "tooltip": "放大后的视频帧，格式为 IMAGE 批次。"}
@@ -54,11 +57,11 @@
     "inputs": {
       "model": {"name": "模型", "tooltip": "选择 FlashVSR 模型版本，推荐使用 V1.1 以获得更稳定的结果。"},
       "mode": {"name": "模式", "tooltip": "处理模式：tiny、tiny-long 或 full。"},
-      "vae_model": {"name": "VAE 模型", "tooltip": "用于解码的 VAE 变体，缺少的 VAE 文件会自动下载。"},
+      "vae_model": {"name": "VAE 模型", "tooltip": "Full 模式可选高保真 Wan2.1 或低显存 LightVAE_W2.1；官方 Wan2.2 使用不兼容的 48 通道潜空间。Tiny 模式固定使用 TCDecoder。"},
       "force_offload": {"name": "强制卸载", "tooltip": "执行完成后将模型移到 CPU 内存，以释放显存。"},
       "precision": {"name": "精度", "tooltip": "推理精度，自动模式在支持时选择 bfloat16。"},
       "device": {"name": "设备", "tooltip": "计算设备，自动模式会选择可用的最佳设备。"},
-      "attention_mode": {"name": "注意力后端", "tooltip": "选择注意力后端。自动模式会选择兼容后端，手动选择不会被其他已安装后端替换。"}
+      "attention_mode": {"name": "注意力后端", "tooltip": "自动模式优先选择支持掩码的后端；Sage/FlashAttention 等稠密后端加速兼容调用，自注意力需要掩码时会用 masked SDPA 保留模型语义。"}
     },
     "outputs": {
       "0": {"name": "处理管线", "tooltip": "供 FlashVSR 高级节点使用的已初始化管线元组。"}

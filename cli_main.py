@@ -17,8 +17,11 @@ For full help:
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 import gc
+import math
 
 # =============================================================================
 # CLI argument parsing - EXHAUSTIVE mapping from ComfyUI node INPUT_TYPES
@@ -39,18 +42,17 @@ Examples:
     # Basic 2x upscale with defaults
     python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 2
 
-    # 4x upscale with tiling enabled for lower VRAM
+    # 4x upscale with VAE tiling enabled for lower VRAM
     python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 4 \\
-        --tiled_vae --tiled_dit --tile_size 256 --tile_overlap 24
+        --tiled_vae --unload_dit
 
-    # Long video with chunking to prevent OOM
+    # Long video using the stateful streaming pipeline
     python cli_main.py --input long_video.mp4 --output upscaled.mp4 \\
-        --frame_chunk_size 50 --mode tiny-long
+        --mode tiny-long
 
-    # Low VRAM mode (8GB GPUs)
+    # Low VRAM mode
     python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 2 \\
-        --vae_model LightVAE_W2.1 --tiled_vae --tiled_dit \\
-        --frame_chunk_size 20 --resize_factor 0.5
+        --vae_model LightVAE_W2.1 --tiled_vae --unload_dit
 
 For more information, visit: https://github.com/DNPMBHC/ComfyUI-FlashVSR
 """
@@ -86,15 +88,15 @@ For more information, visit: https://github.com/DNPMBHC/ComfyUI-FlashVSR
         '--mode',
         type=str,
         choices=['tiny', 'tiny-long', 'full'],
-        default='tiny',
-        help='Operation mode. "tiny": faster, standard memory. "tiny-long": optimized for long videos (lower VRAM). "full": higher quality but max VRAM. (default: tiny)'
+        default='full',
+        help='Operation mode. "full" uses the selected Wan VAE for best reconstruction quality; tiny modes use TCDecoder for speed. (default: full)'
     )
     parser.add_argument(
         '--vae_model',
         type=str,
-        choices=['Wan2.1', 'Wan2.2', 'LightVAE_W2.1', 'TAE_W2.2', 'LightTAE_HY1.5'],
+        choices=['Wan2.1', 'LightVAE_W2.1'],
         default='Wan2.1',
-        help='VAE model: Wan2.1 (default), Wan2.2, LightVAE_W2.1 (50%% less VRAM), TAE_W2.2, LightTAE_HY1.5. Auto-downloads if missing. (default: Wan2.1)'
+        help='VAE decoder: Wan2.1 (highest fidelity) or LightVAE_W2.1 (lower VRAM). The official Wan2.2 VAE uses incompatible 48-channel latents. (default: Wan2.1)'
     )
     parser.add_argument(
         '--force_offload',
@@ -125,7 +127,7 @@ For more information, visit: https://github.com/DNPMBHC/ComfyUI-FlashVSR
         type=str,
         choices=['auto', 'sparse_sage_attention', 'sage_attention', 'block_sparse_attention', 'flash_attention_2', 'flash_attention_3', 'sdpa'],
         default='auto',
-        help='Attention backend. auto selects a GPU-compatible implementation; explicit choices fall back only when unavailable. (default: auto)'
+        help='Attention backend. auto prefers a mask-capable implementation; dense backends accelerate compatible calls while masked self-attention preserves the model topology through masked SDPA. (default: auto)'
     )
 
     # ==========================================================================
@@ -150,6 +152,13 @@ For more information, visit: https://github.com/DNPMBHC/ComfyUI-FlashVSR
         help='Disable color correction.'
     )
     parser.add_argument(
+        '--fix_method',
+        type=str,
+        choices=['wavelet', 'adain'],
+        default='wavelet',
+        help='Color correction method. wavelet preserves generated high-frequency detail; adain matches per-frame statistics. (default: wavelet)'
+    )
+    parser.add_argument(
         '--tiled_vae',
         action='store_true',
         default=False,
@@ -159,7 +168,7 @@ For more information, visit: https://github.com/DNPMBHC/ComfyUI-FlashVSR
         '--tiled_dit',
         action='store_true',
         default=False,
-        help='Enable spatial tiling for the Diffusion Transformer (DiT). Crucial for saving VRAM on large inputs.'
+        help='Deprecated compatibility flag. Spatial DiT tiling is ignored because it changes attention context and reduces quality.'
     )
     parser.add_argument(
         '--tile_size',
@@ -188,15 +197,15 @@ For more information, visit: https://github.com/DNPMBHC/ComfyUI-FlashVSR
     parser.add_argument(
         '--kv_ratio',
         type=float,
-        default=3.0,
-        help='Key/Value cache ratio (1.0-3.0). 1.0 uses less VRAM; 3.0 provides highest quality retention. (default: 3.0)'
+        default=3.5,
+        help='Key/value cache ratio (1.0-10.0). Higher values retain more temporal context at increased VRAM cost. (default: 3.5)'
     )
     parser.add_argument(
         '--local_range',
         type=int,
-        choices=[9, 11],
+        choices=[7, 9, 11],
         default=11,
-        help='Local attention range window. 9 = sharper details; 11 = more stable/consistent results. (default: 11)'
+        help='Local attention range. 11 matches the reference ComfyUI node and favors temporal stability; 9 is sharper. (default: 11)'
     )
     parser.add_argument(
         '--seed',
@@ -208,7 +217,7 @@ For more information, visit: https://github.com/DNPMBHC/ComfyUI-FlashVSR
         '--frame_chunk_size',
         type=int,
         default=0,
-        help='Process video in chunks of N frames to prevent VRAM OOM. 0 = Process all frames at once. (default: 0)'
+        help='Deprecated quality-unsafe option. Only 0 is accepted because external chunks reset streaming attention and decoder state. (default: 0)'
     )
     parser.add_argument(
         '--enable_debug',
@@ -278,7 +287,27 @@ For more information, visit: https://github.com/DNPMBHC/ComfyUI-FlashVSR
         help='Custom path to FlashVSR models directory. If not set, uses ComfyUI default or ./models'
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 1.0 <= args.kv_ratio <= 10.0:
+        parser.error('--kv_ratio must be between 1.0 and 10.0')
+    if not 1.5 <= args.sparse_ratio <= 2.0:
+        parser.error('--sparse_ratio must be between 1.5 and 2.0')
+    if not 0.1 <= args.resize_factor <= 1.0:
+        parser.error('--resize_factor must be between 0.1 and 1.0')
+    if not 0 <= args.crf <= 51:
+        parser.error('--crf must be between 0 and 51')
+    if args.start_frame < 0:
+        parser.error('--start_frame must be zero or greater')
+    if args.end_frame != -1 and args.end_frame <= args.start_frame:
+        parser.error('--end_frame must be greater than --start_frame, or -1')
+    if args.fps is not None and (not math.isfinite(args.fps) or args.fps <= 0):
+        parser.error('--fps must be a positive finite number')
+    if args.frame_chunk_size != 0:
+        parser.error(
+            '--frame_chunk_size is disabled because stateless external chunks reset '
+            'temporal attention and decoder state; use --mode tiny-long instead'
+        )
+    return args
 
 
 # =============================================================================
@@ -290,9 +319,7 @@ For more information, visit: https://github.com/DNPMBHC/ComfyUI-FlashVSR
 # =============================================================================
 
 class VideoReader:
-    """
-    Iterator that reads video frames in chunks to save memory.
-    """
+    """Read the selected frame range as one stateful FlashVSR sequence."""
     def __init__(self, video_path, start_frame=0, end_frame=-1, chunk_size=0):
         import cv2
         self.video_path = video_path
@@ -309,6 +336,8 @@ class VideoReader:
 
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if not math.isfinite(self.fps) or self.fps <= 0:
+            self.fps = 30.0
         
         # Adjust end_frame
         if self.end_frame < 0 or self.end_frame > self.total_frames:
@@ -368,43 +397,70 @@ class VideoReader:
 
 class VideoWriter:
     """
-    Incremental video writer.
+    Incremental FFmpeg writer that honors the requested codec and quality.
     """
     def __init__(self, output_path, fps, width, height, codec='libx264', crf=18):
-        import cv2
         self.output_path = output_path
         self.width = width
         self.height = height
-        self.codec = codec
+        self.codec = {'h264': 'libx264', 'hevc': 'libx265'}.get(codec, codec)
         self.crf = crf
-        
+
         # Ensure output directory exists
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        
-        # Determine codec fourcc
-        if codec in ['libx264', 'h264']:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v') # mp4v is safer for general compatibility without ffmpeg specifically
-        elif codec in ['libx265', 'hevc']:
-            fourcc = cv2.VideoWriter_fourcc(*'hvc1')
-        else:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            
-        self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
-        if not self.out.isOpened():
-             print("Warning: cv2.VideoWriter failed to open with default flags. Trying 'mp4v'.")
-             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-             self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-             if not self.out.isOpened():
-                raise RuntimeError(f"Failed to create output video: {output_path}")
+
+        ffmpeg = shutil.which('ffmpeg')
+        if ffmpeg is None:
+            try:
+                import imageio_ffmpeg
+                ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            except (ImportError, RuntimeError):
+                ffmpeg = None
+        if ffmpeg is None:
+            raise RuntimeError(
+                "FFmpeg is required for quality-controlled CLI output. Install FFmpeg "
+                "or imageio-ffmpeg and ensure it is available on PATH."
+            )
+
+        quality_args = ['-crf', str(crf)]
+        if self.codec.endswith('_nvenc'):
+            quality_args = ['-rc:v', 'vbr', '-cq:v', str(crf), '-b:v', '0']
+        elif self.codec in {'libvpx-vp9', 'libaom-av1'}:
+            quality_args += ['-b:v', '0']
+
+        command = [
+            ffmpeg,
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'rgb24',
+            '-video_size', f'{width}x{height}',
+            '-framerate', str(fps),
+            '-i', 'pipe:0',
+            '-an',
+            '-c:v', self.codec,
+            *quality_args,
+            '-pix_fmt', 'yuv420p',
+            output_path,
+        ]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+        )
 
     def write(self, frames_tensor):
-        import torch
         import numpy as np
-        import cv2
+
+        try:
+            import torch
+        except ImportError:
+            torch = None
         
         # Convert tensor to numpy
-        if isinstance(frames_tensor, torch.Tensor):
+        if torch is not None and isinstance(frames_tensor, torch.Tensor):
             frames_np = frames_tensor.cpu().numpy()
         else:
             frames_np = frames_tensor
@@ -416,13 +472,23 @@ class VideoWriter:
         n_frames = frames_np.shape[0]
         
         for i in range(n_frames):
-            # Convert RGB to BGR for OpenCV
-            frame_bgr = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2BGR)
-            self.out.write(frame_bgr)
+            try:
+                frame = np.ascontiguousarray(frames_np[i])
+                self.process.stdin.write(frame.tobytes())
+            except BrokenPipeError as exc:
+                error = self.process.stderr.read().decode('utf-8', errors='replace').strip()
+                raise RuntimeError(f"FFmpeg stopped while encoding: {error}") from exc
             
     def release(self):
-        if self.out:
-            self.out.release()
+        if self.process is None:
+            return
+        if self.process.stdin is not None and not self.process.stdin.closed:
+            self.process.stdin.close()
+        error = self.process.stderr.read().decode('utf-8', errors='replace').strip()
+        return_code = self.process.wait()
+        self.process = None
+        if return_code != 0:
+            raise RuntimeError(f"FFmpeg failed to encode '{self.output_path}': {error}")
 
 def format_time(seconds):
     """
@@ -431,6 +497,13 @@ def format_time(seconds):
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}"
+
+
+def _resolve_force_offload(args):
+    """Match the Init + Advanced node offload semantics used in ComfyUI."""
+    init_force_offload = args.force_offload and not args.no_force_offload
+    keep_models_on_cpu = args.keep_models_on_cpu and not args.no_keep_models_on_cpu
+    return bool(init_force_offload or keep_models_on_cpu)
 
 
 # =============================================================================
@@ -446,9 +519,8 @@ def main():
         sys.exit(1)
     
     # Handle boolean flag pairs
-    force_offload = args.force_offload and not args.no_force_offload
+    force_offload = _resolve_force_offload(args)
     color_fix = args.color_fix and not args.no_color_fix
-    keep_models_on_cpu = args.keep_models_on_cpu and not args.no_keep_models_on_cpu
 
     print("=" * 60)
     print("FlashVSR CLI - Video Super Resolution")
@@ -512,13 +584,17 @@ def main():
         args.input, 
         start_frame=args.start_frame, 
         end_frame=args.end_frame,
-        chunk_size=args.frame_chunk_size
+        chunk_size=0
     )
     
     input_fps, file_total_frames = reader.get_info()
     
     # Calculate actual frames to process based on reader's resolved range
     total_frames_to_process = reader.end_frame - reader.start_frame
+    if total_frames_to_process <= 0:
+        reader.cap.release()
+        print("Error: The selected frame range contains no frames.", file=sys.stderr)
+        raise SystemExit(1)
     
     if args.end_frame > 0 or args.start_frame > 0:
         print(f"Input: {args.input} ({input_fps:.2f} FPS)")
@@ -562,11 +638,12 @@ def main():
     )
     
     # ==========================================================================
-    # Process video with FlashVSR (Chunk by Chunk)
+    # Process the selected frame range as one stateful FlashVSR sequence
     # ==========================================================================
     print("\nProcessing video with FlashVSR...")
     
     writer = None
+    processing_error = None
     total_processed = 0
     start_time_glob = 0
     
@@ -596,14 +673,13 @@ def main():
             print(f"Progress: {progress_pct:6.2f}% | Processed: {total_processed}/{total_frames_to_process} | "
                   f"Elapsed: {formatted_elapsed} | ETA: {formatted_eta} | Speed: {speed_fps:.2f} fps")
             
-            # Process the chunk
-            # Note: We pass chunk_size=0 to flashvsr because we are feeding it an explicit chunk
-            # that we want processed fully right now.
+            # Process the complete selected frame range as one stateful sequence.
             output_frames = flashvsr(
                 pipe=pipe,
                 frames=frames,
                 scale=args.scale,
                 color_fix=color_fix,
+                fix_method=args.fix_method,
                 tiled_vae=args.tiled_vae,
                 tiled_dit=args.tiled_dit,
                 tile_size=args.tile_size,
@@ -613,11 +689,11 @@ def main():
                 kv_ratio=args.kv_ratio,
                 local_range=args.local_range,
                 seed=args.seed,
-                force_offload=keep_models_on_cpu,  # flashvsr() uses force_offload param for CPU offloading
+                force_offload=force_offload,
                 enable_debug=args.enable_debug,
-                chunk_size=0, # Already chunked
+                chunk_size=0,
                 resize_factor=args.resize_factor,
-                mode=args.mode
+                mode=args.mode,
             )
             
             # Initialize Writer on first chunk
@@ -644,15 +720,26 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 
-    except StopIteration:
-        pass
-    except Exception as e:
-        print(f"\nError during processing: {e}")
+    except Exception as exc:
+        processing_error = exc
+        print(f"\nError during processing: {exc}", file=sys.stderr)
         import traceback
         traceback.print_exc()
     finally:
         if writer:
-            writer.release()
+            try:
+                writer.release()
+            except Exception as exc:
+                if processing_error is None:
+                    processing_error = exc
+                    print(f"\nError while finalizing output: {exc}", file=sys.stderr)
+                    import traceback
+                    traceback.print_exc()
+                else:
+                    print(f"\nAdditional error while finalizing output: {exc}", file=sys.stderr)
+
+    if processing_error is None and total_processed == 0:
+        processing_error = RuntimeError("No frames could be decoded from the selected input range.")
     
     # ==========================================================================
     # Cleanup
@@ -661,6 +748,17 @@ def main():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    if processing_error is not None:
+        if writer is not None and os.path.exists(args.output):
+            try:
+                os.remove(args.output)
+            except OSError as exc:
+                print(
+                    f"Warning: could not remove incomplete output '{args.output}': {exc}",
+                    file=sys.stderr,
+                )
+        raise SystemExit(1) from processing_error
     
     end_time_glob = time.time()
     total_duration = end_time_glob - start_time_glob

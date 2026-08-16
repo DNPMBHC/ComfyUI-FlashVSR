@@ -16,4 +16,5 @@ flash-attn; platform_system!="Windows"
 # wheels; install a matching wheel separately when the target GPU supports it.
 psutil
 opencv-python>=4.8.1.78
+imageio-ffmpeg>=0.5.1
 pyyaml

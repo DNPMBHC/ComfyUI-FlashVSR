@@ -283,7 +283,8 @@ class Encoder3d(nn.Module):
                  num_res_blocks=2,
                  attn_scales=[],
                  temperal_downsample=[True, True, False],
-                 dropout=0.0):
+                 dropout=0.0,
+                 pruning_rate=0.0):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -293,7 +294,7 @@ class Encoder3d(nn.Module):
         self.temperal_downsample = temperal_downsample
 
         # dimensions
-        dims = [dim * u for u in [1] + dim_mult]
+        dims = [int(dim * u * (1 - pruning_rate)) for u in [1] + dim_mult]
         scale = 1.0
 
         # init block
@@ -386,7 +387,8 @@ class Decoder3d(nn.Module):
                  num_res_blocks=2,
                  attn_scales=[],
                  temperal_upsample=[False, True, True],
-                 dropout=0.0):
+                 dropout=0.0,
+                 pruning_rate=0.0):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -396,7 +398,7 @@ class Decoder3d(nn.Module):
         self.temperal_upsample = temperal_upsample
 
         # dimensions
-        dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
+        dims = [int(dim * u * (1 - pruning_rate)) for u in [dim_mult[-1]] + dim_mult[::-1]]
         scale = 1.0 / 2**(len(dim_mult) - 2)
 
         # init block
@@ -499,7 +501,8 @@ class VideoVAE_(nn.Module):
                  num_res_blocks=2,
                  attn_scales=[],
                  temperal_downsample=[False, True, True],
-                 dropout=0.0):
+                 dropout=0.0,
+                 pruning_rate=0.0):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -511,11 +514,13 @@ class VideoVAE_(nn.Module):
 
         # modules
         self.encoder = Encoder3d(dim, z_dim * 2, dim_mult, num_res_blocks,
-                                 attn_scales, self.temperal_downsample, dropout)
+                                 attn_scales, self.temperal_downsample, dropout,
+                                 pruning_rate)
         self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)
         self.conv2 = CausalConv3d(z_dim, z_dim, 1)
         self.decoder = Decoder3d(dim, z_dim, dim_mult, num_res_blocks,
-                                 attn_scales, self.temperal_upsample, dropout)
+                                 attn_scales, self.temperal_upsample, dropout,
+                                 pruning_rate)
 
     def forward(self, x):
         mu, log_var = self.encode(x)
@@ -848,55 +853,43 @@ class WanVideoVAEStateDictConverter:
 
 
 # =====================================================================
-# Wan2.2 VAE Implementation
+# Legacy Wan2.2-Named Compatibility Wrapper
 # =====================================================================
-# Wan2.2 VAE uses the same core VideoVAE_ architecture as Wan2.1, but
-# with different normalization statistics tuned for the new training data.
-# The Mixture-of-Experts (MoE) architecture in Wan2.2 primarily affects
-# the DiT model, not the VAE. The VAE changes include:
-# - Slightly different mean/std statistics for latent normalization
-# - Same compression ratio (8x spatial, 4x temporal)
-# - Enhanced temporal consistency through training (not architecture change)
+# Kept only so older Python imports do not fail. It is the 16-channel Wan2.1
+# topology and is deliberately not exposed by the node or factory as Wan2.2.
 # =====================================================================
 
 class Wan22VideoVAE(nn.Module):
     """
-    Wan2.2 Video VAE - Updated normalization statistics for the
-    improved Wan2.2 training regime. Architecture is compatible with
-    Wan2.1 VAE weights with automatic fallback.
+    Legacy 16-channel Wan2.1 compatibility wrapper retained for old imports.
+
+    This is not the official Wan2.2 VAE. Official Wan2.2 uses 48-channel
+    latents, 16x spatial compression, and a different residual topology, so it
+    cannot decode the fixed 16-channel latents produced by FlashVSR.
     """
 
     def __init__(self, z_dim=16, dim=96):
         super().__init__()
 
-        # Wan2.2 updated normalization statistics
-        # These are optimized for the expanded Wan2.2 training dataset
         mean = [
-            -0.7524, -0.7052, -0.9088, 0.1098, -0.1712, 0.9681, -0.1489, 1.5534,
-            0.4168, -0.0692, 0.5549, -0.3601, -0.1894, -0.9469, 0.2531, -0.2893
+            -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+            0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
         ]
         std = [
-            2.8256, 1.4589, 2.3342, 2.6625, 1.2248, 1.7762, 2.6118, 2.0809,
-            3.2754, 2.1593, 2.8719, 1.5632, 1.6435, 1.1305, 2.8318, 1.9213
+            2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+            3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
         ]
         self.mean = torch.tensor(mean)
         self.std = torch.tensor(std)
         self.scale = [self.mean, 1.0 / self.std]
         
-        # Fallback to Wan2.1 stats for compatibility
-        self._wan21_mean = torch.tensor([
-            -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
-            0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
-        ])
-        self._wan21_std = torch.tensor([
-            2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
-            3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
-        ])
+        self._wan21_mean = self.mean.clone()
+        self._wan21_std = self.std.clone()
 
         # init model - same architecture as Wan2.1
         self.model = VideoVAE_(z_dim=z_dim, dim=dim).eval().requires_grad_(False)
         self.upsampling_factor = 8
-        self.vae_type = "wan2.2"
+        self.vae_type = "wan2.1_compat"
 
     def use_wan21_stats(self):
         """Switch to Wan2.1 normalization for backward compatibility."""
@@ -945,7 +938,7 @@ class Wan22VideoVAE(nn.Module):
         weight = torch.zeros((1, 1, out_T, H * self.upsampling_factor, W * self.upsampling_factor), dtype=hidden_states.dtype, device=data_device)
         values = torch.zeros((1, 3, out_T, H * self.upsampling_factor, W * self.upsampling_factor), dtype=hidden_states.dtype, device=data_device)
 
-        for h, h_, w, w_ in tqdm(tasks, desc="Wan2.2 VAE decoding"):
+        for h, h_, w, w_ in tqdm(tasks, desc="Legacy Wan VAE decoding"):
             hidden_states_batch = hidden_states[:, :, :, h:h_, w:w_].to(computation_device)
             hidden_states_batch = self.model.decode(hidden_states_batch, self.scale).to(data_device)
 
@@ -991,7 +984,7 @@ class Wan22VideoVAE(nn.Module):
         weight = torch.zeros((1, 1, out_T, H // self.upsampling_factor, W // self.upsampling_factor), dtype=video.dtype, device=data_device)
         values = torch.zeros((1, 16, out_T, H // self.upsampling_factor, W // self.upsampling_factor), dtype=video.dtype, device=data_device)
 
-        for h, h_, w, w_ in tqdm(tasks, desc="Wan2.2 VAE encoding"):
+        for h, h_, w, w_ in tqdm(tasks, desc="Legacy Wan VAE encoding"):
             hidden_states_batch = video[:, :, :, h:h_, w:w_].to(computation_device)
             hidden_states_batch = self.model.encode(hidden_states_batch, self.scale).to(data_device)
 
@@ -1105,7 +1098,7 @@ class Wan22VideoVAEStateDictConverter:
 
 # VAE architecture constants
 VAE_FULL_DIM = 96      # Base channel dimension for full VAE
-VAE_LIGHT_DIM = 64     # Base channel dimension for lightweight VAE
+VAE_LIGHT_DIM = 96     # LightVAE starts from Wan dim=96, then prunes 75%
 VAE_Z_DIM = 16         # Latent space dimension
 VAE_UPSAMPLING_FACTOR = 8  # Spatial upsampling factor
 
@@ -1264,31 +1257,36 @@ class LightX2VVAE(nn.Module):
     generation. Features ~50% memory reduction and 2-3x faster inference
     compared to full Wan VAE models.
     
-    Supports loading both LightVAE weights and full Wan VAE weights
-    (automatically adapts architecture).
+    The official LightVAE keeps the Wan block layout and prunes every channel
+    stage by 75 percent. It also uses the standard Wan latent normalization.
     """
 
     def __init__(self, z_dim=16, dim=64, use_full_arch=False):
         super().__init__()
 
-        # LightX2V normalization statistics (tuned for distilled model)
         mean = [
-            -0.7548, -0.7070, -0.9100, 0.1086, -0.1728, 0.9667, -0.1503, 1.5521,
-            0.4151, -0.0703, 0.5533, -0.3616, -0.1908, -0.9483, 0.2517, -0.2907
+            -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+            0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
         ]
         std = [
-            2.8220, 1.4565, 2.3308, 2.6591, 1.2222, 1.7735, 2.6085, 2.0776,
-            3.2720, 2.1559, 2.8685, 1.5605, 1.6408, 1.1279, 2.8284, 1.9186
+            2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+            3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
         ]
         self.mean = torch.tensor(mean)
         self.std = torch.tensor(std)
         self.scale = [self.mean, 1.0 / self.std]
 
-        # Initialize model - use full architecture for compatibility if needed
+        # Full architecture remains available for explicit compatibility, while
+        # the LightVAE path matches the reference pruning_rate=0.75 topology.
         if use_full_arch:
             self.model = VideoVAE_(z_dim=z_dim, dim=96).eval().requires_grad_(False)
         else:
-            self.model = LightVideoVAE_(z_dim=z_dim, dim=dim).eval().requires_grad_(False)
+            self.model = VideoVAE_(
+                z_dim=z_dim,
+                dim=VAE_FULL_DIM,
+                num_res_blocks=2,
+                pruning_rate=0.75,
+            ).eval().requires_grad_(False)
         
         self.upsampling_factor = 8
         self.vae_type = "lightx2v"
@@ -1482,9 +1480,9 @@ def create_video_vae(vae_type="wan2.1", z_dim=16, dim=96, **kwargs):
     Factory function to create the appropriate VAE based on type.
     
     Args:
-        vae_type: One of "wan2.1", "wan2.2", "lightx2v"
+        vae_type: One of "wan2.1", "lightx2v"
         z_dim: Latent dimension (default: 16)
-        dim: Base channel dimension (default: 96 for full, 64 for light)
+        dim: Base channel dimension (default: 96)
         
     Returns:
         Appropriate VAE module instance
@@ -1494,11 +1492,13 @@ def create_video_vae(vae_type="wan2.1", z_dim=16, dim=96, **kwargs):
     if vae_type == "wan2.1":
         return WanVideoVAE(z_dim=z_dim, dim=dim)
     elif vae_type == "wan2.2":
-        return Wan22VideoVAE(z_dim=z_dim, dim=dim)
+        raise ValueError(
+            "Official Wan2.2 VAE uses incompatible 48-channel latents; "
+            "FlashVSR requires a 16-channel Wan2.1-compatible decoder."
+        )
     elif vae_type in ("lightx2v", "lightvae"):
-        # Use full architecture for better compatibility with existing weights
-        use_full = kwargs.get("use_full_arch", True)
-        light_dim = kwargs.get("light_dim", 64)
+        use_full = kwargs.get("use_full_arch", False)
+        light_dim = kwargs.get("light_dim", VAE_LIGHT_DIM)
         return LightX2VVAE(z_dim=z_dim, dim=light_dim, use_full_arch=use_full)
     else:
-        raise ValueError(f"Unknown VAE type: {vae_type}. Supported: wan2.1, wan2.2, lightx2v")
+        raise ValueError(f"Unknown VAE type: {vae_type}. Supported: wan2.1, lightx2v")

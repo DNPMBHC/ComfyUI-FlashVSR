@@ -37,7 +37,7 @@ _ATTENTION_WARNINGS = set()
 def _module_exists(module_name: str) -> bool:
     try:
         return importlib.util.find_spec(module_name) is not None
-    except (ImportError, ValueError):
+    except Exception:
         return False
 
 
@@ -50,7 +50,7 @@ FLASH_ATTN_2_AVAILABLE = _module_exists("flash_attn")
 FLASH_ATTN_3_AVAILABLE = _module_exists("flash_attn_interface")
 BLOCK_ATTN_AVAILABLE = _module_exists("block_sparse_attn")
 SAGE_ATTN_AVAILABLE = _module_exists("sageattention")
-SPARSE_SAGE_ATTN_AVAILABLE = True
+SPARSE_SAGE_ATTN_AVAILABLE = _module_exists("triton")
 
 from PIL import Image
 import numpy as np
@@ -204,9 +204,10 @@ def _backend_declared_available(mode: str) -> bool:
 def _auto_attention_candidates() -> List[str]:
     arch = _cuda_architecture()
     if arch in {"sm120", "sm121"}:
-        # SageAttention 2.2 has an explicit Blackwell CUDA path. The bundled
-        # sparse Triton kernel is not used here because it has no sm120 path.
-        return ["sage_attention", "flash_attention_2", "sdpa"]
+        # The reference FlashVSR path builds a draft/local block mask. Prefer
+        # the Blackwell-capable block-sparse wheel so auto mode keeps those
+        # attention semantics instead of silently switching to dense Sage.
+        return ["block_sparse_attention", "sage_attention", "flash_attention_2", "flash_attention_3", "sdpa"]
     if arch == "sm90":
         return ["flash_attention_3", "flash_attention_2", "sage_attention", "sparse_sage_attention", "sdpa"]
     if arch is not None:
@@ -215,15 +216,9 @@ def _auto_attention_candidates() -> List[str]:
 
 
 def _fallback_attention_candidates(mode: str) -> List[str]:
-    fallbacks = {
-        "sparse_sage_attention": ["sage_attention", "sdpa"],
-        "sage_attention": ["flash_attention_2", "sdpa"],
-        "block_sparse_attention": ["sage_attention", "sdpa"],
-        "flash_attention_2": ["flash_attention_3", "sage_attention", "sdpa"],
-        "flash_attention_3": ["flash_attention_2", "sage_attention", "sdpa"],
-        "sdpa": ["sdpa"],
-    }
-    return fallbacks[mode]
+    # Kept as a private compatibility helper for callers that imported it in
+    # older forks. Explicit modes now have one safe fallback only: SDPA.
+    return ["sdpa"]
 
 
 def _initialize_attention_backend(mode: str) -> bool:
@@ -239,6 +234,11 @@ def _initialize_attention_backend(mode: str) -> bool:
         elif mode == "flash_attention_3":
             _load_flash_attention_3()
         return True
+    except torch.OutOfMemoryError:
+        # OOM is a resource failure, not evidence that the selected kernel is
+        # incompatible. Let the pipeline's OOM recovery handle it without
+        # poisoning backend availability for later inferences.
+        raise
     except Exception as exc:
         _warn_attention_once(
             f"FlashVSR attention backend '{mode}' could not be initialized "
@@ -249,8 +249,12 @@ def _initialize_attention_backend(mode: str) -> bool:
 
 def resolve_attention_mode(attention_mode: Optional[str]) -> str:
     requested = normalize_attention_mode(attention_mode)
-    candidates = _auto_attention_candidates() if requested == "auto" else [requested] + _fallback_attention_candidates(requested)
-    for candidate in candidates:
+    if requested != "auto":
+        # An explicit selection is authoritative. Optional backends must not
+        # replace one another merely because another wheel is installed.
+        return requested if _backend_declared_available(requested) else "sdpa"
+
+    for candidate in _auto_attention_candidates():
         if _backend_declared_available(candidate):
             return candidate
     return "sdpa"
@@ -258,16 +262,17 @@ def resolve_attention_mode(attention_mode: Optional[str]) -> str:
 
 def validate_attention_mode(attention_mode: Optional[str]) -> str:
     requested = normalize_attention_mode(attention_mode)
-    candidates = _auto_attention_candidates() if requested == "auto" else [requested] + _fallback_attention_candidates(requested)
+    candidates = _auto_attention_candidates() if requested == "auto" else [requested]
     for candidate in candidates:
         if not _backend_declared_available(candidate):
             continue
         if _initialize_attention_backend(candidate):
-            if candidate != requested and requested != "auto":
-                _warn_attention_once(
-                    f"FlashVSR attention backend '{requested}' is unavailable; using '{candidate}'."
-                )
             return candidate
+
+    if requested != "auto" and requested != "sdpa":
+        _warn_attention_once(
+            f"FlashVSR attention backend '{requested}' is unavailable; using PyTorch SDPA."
+        )
     return "sdpa"
 
 # ----------------------------
@@ -459,6 +464,80 @@ def _sdpa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
     return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
 
 
+def _block_masked_sdpa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                                 num_heads: int, attention_mask: torch.Tensor):
+    """SDPA fallback for a block-level mask without materializing a token mask."""
+    q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+    k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+    v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+
+    if attention_mask.ndim == 3:
+        attention_mask = attention_mask.unsqueeze(0)
+    if attention_mask.ndim != 4:
+        raise ValueError(
+            "Block attention mask must have shape [batch, heads, query_blocks, key_blocks]."
+        )
+
+    batch_size, _, query_length, head_dim = q.shape
+    key_length = k.shape[2]
+    mask_batch, mask_heads, query_blocks, key_blocks = attention_mask.shape
+    if mask_batch not in (1, batch_size):
+        raise ValueError(f"Block attention mask batch dimension {mask_batch} cannot broadcast to {batch_size}.")
+    if mask_heads not in (1, num_heads):
+        raise ValueError(f"Block attention mask head dimension {mask_heads} cannot broadcast to {num_heads}.")
+    if query_blocks == 0 or key_blocks == 0:
+        raise ValueError("Block attention mask must contain at least one query and key block.")
+    if query_length % query_blocks or key_length % key_blocks:
+        raise ValueError(
+            "Attention sequence lengths must be divisible by their block-mask dimensions "
+            f"(query={query_length}/{query_blocks}, key={key_length}/{key_blocks})."
+        )
+
+    attention_mask = attention_mask.to(device=q.device, dtype=torch.bool)
+    attention_mask = attention_mask.expand(batch_size, num_heads, query_blocks, key_blocks)
+    query_block_size = query_length // query_blocks
+    key_block_size = key_length // key_blocks
+
+    q_blocks = q.reshape(batch_size, num_heads, query_blocks, query_block_size, head_dim)
+    k_blocks = k.reshape(batch_size, num_heads, key_blocks, key_block_size, head_dim)
+    v_blocks = v.reshape(batch_size, num_heads, key_blocks, key_block_size, head_dim)
+    output_blocks = torch.empty_like(q_blocks)
+    has_empty_rows = False
+
+    # The emergency path launches SDPA per block/head and gathers only allowed
+    # key blocks. Memory stays proportional to selected blocks instead of the
+    # full query_length x key_length token mask.
+    for batch_index in range(batch_size):
+        for head_index in range(num_heads):
+            head_k = k_blocks[batch_index, head_index]
+            head_v = v_blocks[batch_index, head_index]
+            for query_block_index in range(query_blocks):
+                allowed_blocks = torch.nonzero(
+                    attention_mask[batch_index, head_index, query_block_index],
+                    as_tuple=False,
+                ).flatten()
+                if allowed_blocks.numel() == 0:
+                    output_blocks[batch_index, head_index, query_block_index].zero_()
+                    has_empty_rows = True
+                    continue
+
+                selected_k = head_k.index_select(0, allowed_blocks).reshape(1, 1, -1, head_dim)
+                selected_v = head_v.index_select(0, allowed_blocks).reshape(1, 1, -1, head_dim)
+                query_block = q_blocks[
+                    batch_index, head_index, query_block_index
+                ].unsqueeze(0).unsqueeze(0)
+                output_blocks[batch_index, head_index, query_block_index] = (
+                    F.scaled_dot_product_attention(query_block, selected_k, selected_v)[0, 0]
+                )
+
+    if has_empty_rows:
+        _warn_attention_once(
+            "FlashVSR block attention mask contains empty rows; their fallback output was set to zero."
+        )
+    x = output_blocks.reshape(batch_size, num_heads, query_length, head_dim)
+    return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+
+
 def _flash_attention_2(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int):
     flash_attention_2_module = _load_flash_attention_2()
     q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
@@ -536,25 +615,52 @@ def _block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int,
                     compatibility_mode=False, attention_mask=None, return_KV=False,
                     attention_mode=None):
-    mode = "sdpa" if compatibility_mode else resolve_attention_mode(attention_mode)
+    requested_mode = "sdpa" if compatibility_mode else normalize_attention_mode(attention_mode)
+    mode = "sdpa" if compatibility_mode else resolve_attention_mode(requested_mode)
+    sparse_modes = {"sparse_sage_attention", "block_sparse_attention"}
+
+    if requested_mode in sparse_modes and mode == "sdpa" and attention_mask is not None:
+        _warn_attention_once(
+            f"FlashVSR attention backend '{requested_mode}' is unavailable; falling back to "
+            "block-masked PyTorch SDPA and preserving the attention mask."
+        )
+        return _block_masked_sdpa_attention(q, k, v, num_heads, attention_mask)
+
+    if requested_mode not in {"auto", "sdpa"} and mode != requested_mode:
+        _warn_attention_once(
+            f"FlashVSR attention backend '{requested_mode}' is unavailable; "
+            "falling back to PyTorch SDPA."
+        )
+
+    if attention_mask is not None and mode not in sparse_modes:
+        if mode != "sdpa":
+            _warn_attention_once(
+                f"FlashVSR attention backend '{mode}' cannot consume the model's block mask; "
+                "using block-masked PyTorch SDPA for Self-Attention."
+            )
+        return _block_masked_sdpa_attention(q, k, v, num_heads, attention_mask)
 
     try:
         if mode == "sparse_sage_attention" and attention_mask is not None:
             return _sparse_sage_attention(q, k, v, num_heads, attention_mask)
         if mode == "block_sparse_attention" and attention_mask is not None:
             return _block_sparse_attention(q, k, v, num_heads, attention_mask)
-        if mode in {"sparse_sage_attention", "block_sparse_attention"}:
-            return flash_attention(
-                q, k, v,
-                num_heads=num_heads,
-                attention_mode="sage_attention",
+        if mode in sparse_modes:
+            _warn_attention_once(
+                f"FlashVSR attention backend '{mode}' received no block mask; "
+                "using PyTorch SDPA for this dense attention call."
             )
+            return _sdpa_attention(q, k, v, num_heads)
         if mode == "sage_attention":
             return _sage_attention(q, k, v, num_heads)
         if mode == "flash_attention_2":
             return _flash_attention_2(q, k, v, num_heads)
         if mode == "flash_attention_3":
             return _flash_attention_3(q, k, v, num_heads)
+    except torch.OutOfMemoryError:
+        # Preserve the backend state so the caller can recover memory and
+        # retry the same user-selected implementation.
+        raise
     except Exception as exc:
         global FLASH_ATTN_2_AVAILABLE, FLASH_ATTN_3_AVAILABLE
         global BLOCK_ATTN_AVAILABLE, SPARSE_SAGE_ATTN_AVAILABLE, SAGE_ATTN_AVAILABLE
@@ -568,18 +674,17 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
             BLOCK_ATTN_AVAILABLE = False
         elif mode == "sparse_sage_attention":
             SPARSE_SAGE_ATTN_AVAILABLE = False
+        if mode in sparse_modes and attention_mask is not None:
+            _warn_attention_once(
+                f"FlashVSR attention backend '{mode}' failed ({type(exc).__name__}: {exc}); "
+                "falling back to block-masked PyTorch SDPA and preserving the attention mask."
+            )
+            return _block_masked_sdpa_attention(q, k, v, num_heads, attention_mask)
+
         _warn_attention_once(
             f"FlashVSR attention backend '{mode}' failed ({type(exc).__name__}: {exc}); "
-            "selecting a fallback backend."
+            "falling back to PyTorch SDPA."
         )
-        fallback_mode = resolve_attention_mode(mode)
-        if fallback_mode != mode and fallback_mode != "sdpa":
-            return flash_attention(
-                q, k, v,
-                num_heads=num_heads,
-                attention_mask=attention_mask,
-                attention_mode=fallback_mode,
-            )
 
     return _sdpa_attention(q, k, v, num_heads)
 
@@ -674,6 +779,12 @@ class SelfAttention(nn.Module):
         self.attn = AttentionModule(self.num_heads)
         self.local_attn_mask = None
 
+    def clear_runtime_cache(self):
+        self.local_attn_mask = None
+        self.local_attn_mask_h = None
+        self.local_attn_mask_w = None
+        self.local_range = None
+
     def forward(self, x, freqs, f=None, h=None, w=None, local_num=None, topk=None,
                 train_img=False, block_id=None, kv_len=None, is_full_block=False,
                 is_stream=False, pre_cache_k=None, pre_cache_v=None, local_range = 9):
@@ -716,17 +827,26 @@ class SelfAttention(nn.Module):
         window_size = win[0]*h*w//128
 
         attention_mode = self.attn.attention_mode
-        attention_mask = None
-        if attention_mode in ("block_sparse_attention", "sparse_sage_attention"):
-            if self.local_attn_mask is None or self.local_attn_mask_h!=h//8 or self.local_attn_mask_w!=w//8 or self.local_range!=local_range:
-                self.local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(h//8, w//8, local_range, local_range, include_self=True, device=k_w.device)
-                self.local_attn_mask_h = h//8
-                self.local_attn_mask_w = w//8
-                self.local_range = local_range
-            if attention_mode == "block_sparse_attention":
-                attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
-            else:
-                attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+        if (self.local_attn_mask is None
+                or self.local_attn_mask_h != h // 8
+                or self.local_attn_mask_w != w // 8
+                or self.local_range != local_range
+                or self.local_attn_mask.device != k_w.device):
+            self.local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(h//8, w//8, local_range, local_range, include_self=True, device=k_w.device)
+            self.local_attn_mask_h = h//8
+            self.local_attn_mask_w = w//8
+            self.local_range = local_range
+
+        if attention_mode == "sparse_sage_attention":
+            attention_mask = generate_draft_block_mask_sage(
+                B, self.num_heads, seqlen, q_w, k_w,
+                topk=topk, local_attn_mask=self.local_attn_mask,
+            )
+        else:
+            attention_mask = generate_draft_block_mask(
+                B, self.num_heads, seqlen, q_w, k_w,
+                topk=topk, local_attn_mask=self.local_attn_mask,
+            )
 
         x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
 
@@ -946,6 +1066,12 @@ class WanModel(torch.nn.Module):
     def clear_cross_kv(self):
         for blk in self.blocks:
             blk.cross_attn.clear_cache()
+        self._cross_kv_initialized = False
+
+    def clear_runtime_caches(self):
+        for blk in self.blocks:
+            blk.cross_attn.clear_cache()
+            blk.self_attn.clear_runtime_cache()
         self._cross_kv_initialized = False
 
     @torch.no_grad()

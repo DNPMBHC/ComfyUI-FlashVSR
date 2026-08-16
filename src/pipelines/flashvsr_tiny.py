@@ -158,12 +158,14 @@ class FlashVSRTinyPipeline(BasePipeline):
         self.scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
         self.dit: WanModel = None
         self.vae: WanVideoVAE = None
+        self.TCDecoder = None
         self.model_names = ['dit', 'vae']
         self.height_division_factor = 16
         self.width_division_factor = 16
         self.use_unified_sequence_parallel = False
         self.prompt_emb_posi = None
         self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
+        self.attention_mode = None
 
         print(r"""
  ███████╗██╗      █████╗ ███████╗██╗  ██╗██╗   ██╗███████╗█████╗
@@ -281,6 +283,8 @@ class FlashVSRTinyPipeline(BasePipeline):
         return frames
 
     def decode_video(self, latents, cond=None, **kwargs):
+        if self.TCDecoder is None:
+            raise RuntimeError("TCDecoder is required for FlashVSR Tiny decoding.")
         frames = self.TCDecoder.decode_video(
             latents.transpose(1, 2), # TCDecoder 需要 (B, F, C, H, W)
             parallel=False,
@@ -290,8 +294,51 @@ class FlashVSRTinyPipeline(BasePipeline):
 
         return frames
 
+    def _apply_color_fix(
+        self,
+        frames,
+        lq_video,
+        color_fix=True,
+        fix_method="wavelet",
+        chunk_size=16,
+        pad_first_frame=None,
+    ):
+        if not color_fix or lq_video is None:
+            return frames
+
+        fix_method = str(fix_method).lower()
+        if fix_method not in ("wavelet", "adain"):
+            raise ValueError(f"Unsupported color-fix method: {fix_method}")
+
+        use_first_frame_pad = fix_method == "wavelet" if pad_first_frame is None else bool(pad_first_frame)
+        target_device = self.device
+        frames = frames.detach().to("cpu", dtype=torch.float32).to(target_device)
+        lq_frames = lq_video[:, :, :frames.shape[2]].detach().to(
+            "cpu", dtype=torch.float32
+        ).to(target_device)
+        if lq_frames.shape != frames.shape:
+            raise ValueError(
+                f"Color-fix shape mismatch: decoded={tuple(frames.shape)}, LQ={tuple(lq_frames.shape)}"
+            )
+
+        if use_first_frame_pad:
+            frames = torch.cat([frames[:, :, :1], frames], dim=2)
+            lq_frames = torch.cat([lq_frames[:, :, :1], lq_frames], dim=2)
+
+        frames = self.ColorCorrector(
+            frames,
+            lq_frames,
+            clip_range=(-1, 1),
+            chunk_size=chunk_size,
+            method=fix_method,
+        )
+        if use_first_frame_pad:
+            frames = frames[:, :, 1:]
+        return frames
+
     def offload_model(self, keep_vae=False):
-        self.dit.clear_cross_kv()
+        clear_caches = getattr(self.dit, "clear_runtime_caches", None) or self.dit.clear_cross_kv
+        clear_caches()
         self.prompt_emb_posi['stats'] = "offload"
         self.load_models_to_device([])
         if hasattr(self.dit, "LQ_proj_in"):
@@ -327,12 +374,21 @@ class FlashVSRTinyPipeline(BasePipeline):
         kv_ratio=3.0,
         local_range = 9,
         color_fix = True,
+        fix_method = "wavelet",
+        color_fix_chunk_size = 16,
+        pad_first_frame = None,
+        attention_mode = None,
         unload_dit = False,
         force_offload = False,
         enable_debug_logging = False,
     ):
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
+
+        if num_frames < 25:
+            raise ValueError(
+                f"FlashVSR Tiny requires at least 25 padded frames, got {num_frames}."
+            )
 
         # 要求：必须先 init_cross_kv()
         if self.prompt_emb_posi is None or 'context' not in self.prompt_emb_posi:
@@ -343,14 +399,15 @@ class FlashVSRTinyPipeline(BasePipeline):
                 "    pipe.init_cross_kv(context_tensor=your_context_tensor)"
             )
 
+        requested_attention_mode = attention_mode or self.attention_mode
+        if requested_attention_mode is not None and hasattr(self.dit, "set_attention_mode"):
+            self.attention_mode = self.dit.set_attention_mode(requested_attention_mode)
+
         # 尺寸修正
         height, width = self.check_resize_height_width(height, width)
         if num_frames % 4 != 1:
             num_frames = (num_frames + 2) // 4 * 4 + 1
             print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
-
-        # Tiler 参数
-        tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
 
         # 初始化噪声
         if if_buffer:
@@ -360,9 +417,6 @@ class FlashVSRTinyPipeline(BasePipeline):
         # noise = noise.to(dtype=self.torch_dtype, device=self.device)
         latents = noise
 
-        process_total_num = (num_frames - 8 - 1) // 8 + 1 # Adjusted logic from tiny-long or similar
-        # tiny logic was: (num_frames - 1) // 8 - 2
-        # tiny-long logic: (num_frames - 1) // 8 - 2
         process_total_num = (num_frames - 1) // 8 - 2
 
         is_stream = True
@@ -371,19 +425,14 @@ class FlashVSRTinyPipeline(BasePipeline):
             self.init_cross_kv(context_tensor=self.prompt_emb_posi['context'])
         self.load_models_to_device(["dit"])
         self.dit.LQ_proj_in.to(self.device)
-        self.TCDecoder.to(self.device)
 
         # 清理可能存在的 LQ_proj_in cache
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.clear_cache()
 
-        frames_total = [] # Streaming accumulator
+        latent_segments = []
         LQ_pre_idx = 0
         LQ_cur_idx = 0
-        self.TCDecoder.clean_mem()
-
-        # Tile states for VAE
-        vae_tile_states = {}
 
         with torch.no_grad():
             for cur_process_idx in progress_bar_cmd(range(process_total_num)):
@@ -441,119 +490,84 @@ class FlashVSRTinyPipeline(BasePipeline):
                     t_mod=self.t_mod,
                     t=self.t,
                     local_range = local_range,
+                    attention_mode=self.attention_mode,
                 )
 
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
-
-                # Streaming Decode!
-                cur_LQ_frame = LQ_video[:,:,LQ_pre_idx:LQ_cur_idx,:,:].to(self.device)
-
-                if tiled: # tiled_vae logic
-                    B, C, T, H, W = cur_latents.shape
-
-                    l_tile_h, l_tile_w = tile_size
-                    l_stride_h, l_stride_w = tile_stride
-
-                    if isinstance(l_tile_h, tuple): l_tile_h = l_tile_h[0]
-                    if isinstance(l_tile_w, tuple): l_tile_w = l_tile_w[0]
-
-                    l_tile_h = max(l_tile_h // 8, 4)
-                    l_tile_w = max(l_tile_w // 8, 4)
-                    l_stride_h = max(l_stride_h // 8, 1)
-                    l_stride_w = max(l_stride_w // 8, 1)
-
-                    out_H = H * 8
-                    out_W = W * 8
-
-                    # Calculate expected output temporal dimension
-                    # TCDecoder has 2 TGrow(stride=2) layers, so T is multiplied by 4
-                    # Trimming removes first `frames_to_trim` frames only when memory is uninitialized
-                    # Check if this is the first tile to determine trim behavior
-                    # Note: Index -8 checks a specific MemBlock in the decoder to determine if state exists
-                    sample_tile_key = (0, 0)
-                    if sample_tile_key not in vae_tile_states or vae_tile_states[sample_tile_key][-8] is None:
-                        # First decode - trimming will occur (frames_to_trim = 2**sum(decoder_time_upscale) - 1 = 3)
-                        T_out = T * 4 - self.TCDecoder.frames_to_trim
-                    else:
-                        # Subsequent decode - no trimming
-                        T_out = T * 4
-
-                    cur_frames = torch.zeros((B, 3, T_out, out_H, out_W), dtype=cur_latents.dtype, device='cpu')
-                    weights = torch.zeros((B, 3, T_out, out_H, out_W), dtype=cur_latents.dtype, device='cpu')
-
-                    for y in range(0, H, l_stride_h):
-                        for x in range(0, W, l_stride_w):
-                            y_end = min(y + l_tile_h, H)
-                            x_end = min(x + l_tile_w, W)
-
-                            if y_end <= y or x_end <= x: continue
-
-                            lat_tile = cur_latents[:, :, :, y:y_end, x:x_end]
-                            cond_y, cond_x = y * 8, x * 8
-                            cond_y_end, cond_x_end = y_end * 8, x_end * 8
-                            cond_tile = cur_LQ_frame[:, :, :, cond_y:cond_y_end, cond_x:cond_x_end]
-
-                            tile_key = (y, x)
-                            if tile_key not in vae_tile_states:
-                                vae_tile_states[tile_key] = [None] * len(self.TCDecoder.decoder)
-                            mem_tile = vae_tile_states[tile_key]
-
-                            out_tile, new_mem_tile = self.TCDecoder.decode_video(
-                                lat_tile.transpose(1, 2),
-                                parallel=False,
-                                show_progress_bar=False,
-                                cond=cond_tile,
-                                mem=mem_tile
-                            )
-                            vae_tile_states[tile_key] = new_mem_tile
-
-                            out_tile = out_tile.transpose(1, 2).to('cpu')
-                            th, tw = out_tile.shape[3], out_tile.shape[4]
-                            mask = torch.ones((1, 1, 1, th, tw), device='cpu')
-                            y_out, x_out = y * 8, x * 8
-                            cur_frames[:, :, :, y_out:y_out+th, x_out:x_out+tw] += out_tile * mask
-                            weights[:, :, :, y_out:y_out+th, x_out:x_out+tw] += mask
-
-                    weights[weights == 0] = 1.0
-                    cur_frames = cur_frames / weights
-                    cur_frames = cur_frames.mul_(2).sub_(1)
-                else:
-                    cur_frames = self.TCDecoder.decode_video(
-                        cur_latents.transpose(1, 2),
-                        parallel=False,
-                        show_progress_bar=False,
-                        cond=cur_LQ_frame
-                    ).transpose(1, 2).mul_(2).sub_(1)
-
-                # 颜色校正（wavelet）
-                try:
-                    if color_fix:
-                        cur_frames = self.ColorCorrector(
-                            cur_frames.to(device=self.device),
-                            cur_LQ_frame,
-                            clip_range=(-1, 1),
-                            chunk_size=16,
-                            method='adain'
-                        ).to('cpu') # Ensure back to CPU
-                except:
-                    pass
-
-                frames_total.append(cur_frames)
+                latent_segments.append((
+                    cur_latents.detach().to("cpu"),
+                    LQ_pre_idx,
+                    LQ_cur_idx,
+                ))
                 LQ_pre_idx = LQ_cur_idx
+                del noise_pred_posi, cur_latents
 
                 if unload_dit:
-                    del noise_pred_posi, cur_frames, cur_latents, cur_LQ_frame
                     clean_vram()
 
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
 
+            del latents
+            LQ_latents = None
+            pre_cache_k = None
+            pre_cache_v = None
+            if unload_dit:
+                clear_caches = getattr(self.dit, "clear_runtime_caches", None) or self.dit.clear_cross_kv
+                clear_caches()
+                self.prompt_emb_posi['stats'] = "offload"
+                self.dit.to("cpu")
+            clean_vram()
+
+            self.TCDecoder.to(self.device)
             self.TCDecoder.clean_mem()
+            frame_segments = []
+            try:
+                for segment_idx, (latent_segment, lq_start, lq_end) in enumerate(latent_segments):
+                    latent_segments[segment_idx] = None
+                    latent_segment = latent_segment.to(
+                        device=self.device,
+                        dtype=self.torch_dtype,
+                    )
+                    cond_segment = None
+                    if LQ_video is not None:
+                        cond_segment = LQ_video[:, :, lq_start:lq_end].to(
+                            device=self.device,
+                            dtype=latent_segment.dtype,
+                        )
+
+                    decoded_segment = self.decode_video(
+                        latent_segment,
+                        cond=cond_segment,
+                    )
+                    try:
+                        decoded_segment = self._apply_color_fix(
+                            decoded_segment,
+                            cond_segment,
+                            color_fix=color_fix,
+                            fix_method=fix_method,
+                            chunk_size=color_fix_chunk_size,
+                            pad_first_frame=pad_first_frame,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"FlashVSR Tiny color correction failed for segment "
+                            f"{segment_idx + 1}; returning it uncorrected: {exc}"
+                        )
+
+                    frame_segments.append(decoded_segment.to("cpu"))
+                    del latent_segment, cond_segment, decoded_segment
+            finally:
+                self.TCDecoder.clean_mem()
+
+            frames = torch.cat(frame_segments, dim=2)
+            if frames.shape[2] != LQ_cur_idx:
+                raise RuntimeError(
+                    f"TCDecoder produced {frames.shape[2]} frames; expected {LQ_cur_idx}."
+                )
             if force_offload:
                 self.offload_model()
-
-            frames = torch.cat(frames_total, dim=2)
 
         return frames[0]
 
@@ -630,8 +644,13 @@ def model_fn_wan_video(
     t_mod : torch.Tensor = None,
     t : torch.Tensor = None,
     local_range: int = 9,
+    attention_mode: Optional[str] = None,
     **kwargs,
 ):
+    if attention_mode is not None and hasattr(dit, "set_attention_mode"):
+        effective_mode = getattr(dit, "attention_mode", None)
+        if effective_mode != attention_mode:
+            dit.set_attention_mode(attention_mode)
     # patchify
     x, (f, h, w) = dit.patchify(x)
 

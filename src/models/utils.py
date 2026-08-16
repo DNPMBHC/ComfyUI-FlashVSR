@@ -95,6 +95,67 @@ def load_state_dict_from_bin(file_path, torch_dtype=None):
     return state_dict
 
 
+def normalize_checkpoint_state_dict(state_dict, target_state_dict):
+    """Unwrap and align common checkpoint prefixes to a target module."""
+    wrapper_keys = ("state_dict", "model_state", "model", "module", "ema", "params")
+    while isinstance(state_dict, dict):
+        wrapped = next(
+            (
+                state_dict[key]
+                for key in wrapper_keys
+                if isinstance(state_dict.get(key), dict) and state_dict[key]
+            ),
+            None,
+        )
+        if wrapped is None:
+            break
+        state_dict = wrapped
+
+    if not isinstance(state_dict, dict):
+        raise RuntimeError("Checkpoint does not contain a state dictionary.")
+
+    state_dict = {
+        str(key): value
+        for key, value in state_dict.items()
+        if isinstance(value, torch.Tensor)
+    }
+    if not state_dict:
+        raise RuntimeError("Checkpoint state dictionary contains no tensors.")
+
+    candidates = [state_dict]
+    seen = {tuple(sorted(state_dict))}
+    index = 0
+    while index < len(candidates):
+        candidate = candidates[index]
+        index += 1
+        for prefix in ("module.", "model."):
+            if all(key.startswith(prefix) for key in candidate):
+                stripped = {key[len(prefix):]: value for key, value in candidate.items()}
+                signature = tuple(sorted(stripped))
+                if signature not in seen:
+                    candidates.append(stripped)
+                    seen.add(signature)
+
+    for candidate in tuple(candidates):
+        prefixed = {f"model.{key}": value for key, value in candidate.items()}
+        signature = tuple(sorted(prefixed))
+        if signature not in seen:
+            candidates.append(prefixed)
+            seen.add(signature)
+
+    target_keys = set(target_state_dict)
+
+    def score(candidate):
+        overlap = target_keys.intersection(candidate)
+        shape_matches = sum(
+            tuple(candidate[key].shape) == tuple(target_state_dict[key].shape)
+            for key in overlap
+        )
+        return shape_matches, len(overlap), -abs(len(candidate) - len(target_keys))
+
+    return max(candidates, key=score)
+
+
 def search_for_embeddings(state_dict):
     embeddings = []
     for k in state_dict:

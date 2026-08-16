@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Added official ComfyUI node definitions for English and Simplified Chinese under `locales/`.
+- Added `fix_method` selection with `wavelet` as the quality-first default and `adain` as an explicit alternative.
 
 ### Changed
 
@@ -17,18 +18,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replaced the tracked local model-path configuration with `model_paths.yaml.example`; local `model_paths.yaml` files are now ignored.
 - Sanitized the sample workflow by removing machine-specific input/output paths and stale node-source metadata.
 - Removed the stale `node.zip` source snapshot from version control.
+- Reduced validated Full-mode VAE choices to `Wan2.1` and `LightVAE_W2.1`; the official Wan2.2 VAE is incompatible with FlashVSR's latent contract.
+- Clarified decoder ownership: Full mode uses the selected VAE; Tiny and Tiny-Long use the streaming TCDecoder.
+- Quality defaults are now BF16 when supported, wavelet color correction, `kv_ratio=3.5`, and `local_range=11`.
+- DiT spatial tiling and stateless external frame chunking are no longer enabled automatically. Nonzero CLI `frame_chunk_size` values are rejected because they reset temporal state.
 
 ### Performance
 
-- Added architecture-aware `auto` attention selection with RTX 50 series support through SageAttention 2.2.
+- Added architecture-aware `auto` attention selection with RTX 50 series support through mask-preserving Block Sparse Attention.
 - Added explicit `sage_attention` and `flash_attention_3` backends while preserving explicit user selection.
-- Added lazy binary-extension loading, version/capability reporting, and chained runtime fallbacks.
+- Added lazy binary-extension loading, version/capability reporting, and mask-preserving runtime fallbacks.
 - FlashAttention 3 is restricted to known-compatible Hopper devices unless `FLASHVSR_ENABLE_EXPERIMENTAL_FA3=1` is set.
 
 ### Bug Fixes
 
 - Optional attention packages no longer override the node-selected backend merely because they are installed.
 - Broken or incompatible CUDA extensions fall back without being retried for every attention call.
+- Attention backend fallbacks preserve the model's draft/local block-mask semantics.
+- Full-mode decoder selection no longer silently advertises unsupported TAE/LightTAE mappings.
+- Full and Tiny pipelines now preserve decoder temporal context, apply FP32 color correction, and reject invalid short internal frame sequences explicitly.
+- CLI encoding now honors the selected FFmpeg codec/quality settings and exits nonzero after processing or finalization failures.
 
 
 ## [1.3.0] - 2026-02-03

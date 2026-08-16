@@ -1,7 +1,7 @@
 from typing_extensions import Literal, TypeAlias
 
 from ..models.wan_video_dit import WanModel
-from ..models.wan_video_vae import WanVideoVAE, Wan22VideoVAE, LightX2VVAE
+from ..models.wan_video_vae import WanVideoVAE
 
 
 model_loader_configs = [
@@ -20,11 +20,9 @@ model_loader_configs = [
     # Wan2.1 VAE (default)
     (None, "1378ea763357eea97acdef78e65d6d96", ["wan_video_vae"], [WanVideoVAE], "civitai"),
     (None, "ccc42284ea13e1ad04693284c7a09be6", ["wan_video_vae"], [WanVideoVAE], "civitai"),
-    # Note: Wan2.2 VAE and LightX2V VAE share the same weight structure as Wan2.1 VAE.
-    # They use the same hash values because the architecture is identical - only the
-    # normalization statistics and internal processing differ. This allows loading
-    # Wan2.1 weights into any VAE variant via the init_pipeline vae_type parameter.
-    # The VAE type selection is done at runtime, not at model detection time.
+    # LightVAE is loaded explicitly by the node because its pruned tensors have
+    # different shapes. Official Wan2.2 uses 48-channel latents and is not
+    # compatible with FlashVSR's fixed 16-channel DiT contract.
 ]
 huggingface_model_loader_configs = [
     # These configs are provided for detecting model type automatically.

@@ -6,17 +6,19 @@
       "frames": {"name": "Frames", "tooltip": "Input video frames as an IMAGE batch (N, H, W, C)."},
       "model": {"name": "Model", "tooltip": "FlashVSR model version. V1.1 is recommended for stability."},
       "mode": {"name": "Mode", "tooltip": "Processing mode: tiny is faster, tiny-long is optimized for long videos, and full prioritizes quality."},
-      "vae_model": {"name": "VAE Model", "tooltip": "VAE variant used for decoding. Missing VAE files are downloaded automatically."},
+      "vae_model": {"name": "VAE Model", "tooltip": "Full-mode decoder: Wan2.1 for highest fidelity or LightVAE_W2.1 for lower VRAM. Official Wan2.2 uses incompatible 48-channel latents. Tiny modes use TCDecoder."},
       "scale": {"name": "Scale", "tooltip": "Output upscaling factor: 2x or 4x."},
-      "tiled_vae": {"name": "Tiled VAE", "tooltip": "Decode the VAE in spatial tiles to reduce VRAM usage."},
-      "tiled_dit": {"name": "Tiled DiT", "tooltip": "Process the diffusion transformer in spatial tiles to reduce VRAM usage."},
+      "color_fix": {"name": "Color Fix", "tooltip": "Match decoded colors to the input using the selected correction method."},
+      "fix_method": {"name": "Color Fix Method", "tooltip": "Wavelet is the default and preserves generated high-frequency detail; AdaIN matches per-frame color statistics."},
+      "tiled_vae": {"name": "Tiled VAE", "tooltip": "Use the Full Wan VAE's native tiler to reduce decode VRAM. Tiny modes ignore this option."},
+      "tiled_dit": {"name": "Tiled DiT (Deprecated)", "tooltip": "Kept for workflow compatibility and ignored at runtime because independent DiT tiles reduce quality."},
       "unload_dit": {"name": "Unload DiT", "tooltip": "Unload the DiT before VAE decoding to free VRAM."},
       "seed": {"name": "Seed", "tooltip": "Random seed used for reproducible noise generation."},
-      "frame_chunk_size": {"name": "Frame Chunk Size", "tooltip": "Process this many frames per chunk. 0 processes all frames at once."},
-      "attention_mode": {"name": "Attention Backend", "tooltip": "Select the attention backend. Auto chooses a compatible backend and explicit choices are preserved."},
+      "frame_chunk_size": {"name": "Frame Chunk Size", "tooltip": "External stateless frame chunking is disabled for quality; nonzero values are ignored. Use tiny-long for stateful long-video processing."},
+      "attention_mode": {"name": "Attention Backend", "tooltip": "Auto prefers a mask-capable backend. Dense Sage/FlashAttention choices accelerate compatible calls; masked self-attention keeps the model topology through masked SDPA when needed."},
       "enable_debug": {"name": "Debug Logging", "tooltip": "Enable detailed progress, timing, and VRAM logging."},
       "keep_models_on_cpu": {"name": "Keep Models on CPU", "tooltip": "Keep inactive models in CPU RAM to reduce VRAM pressure."},
-      "resize_factor": {"name": "Resize Factor", "tooltip": "Resize input frames before processing. Lower values reduce VRAM usage."}
+      "resize_factor": {"name": "Resize Factor", "tooltip": "Keep at 1.0 for full quality. Lower values discard source detail before super-resolution."}
     },
     "outputs": {
       "0": {"name": "Image", "tooltip": "Upscaled video frames as an IMAGE batch."}
@@ -29,20 +31,21 @@
       "pipe": {"name": "Pipeline", "tooltip": "Pipeline object created by the FlashVSR Init Pipeline node."},
       "frames": {"name": "Frames", "tooltip": "Input video frames as an IMAGE batch (N, H, W, C)."},
       "scale": {"name": "Scale", "tooltip": "Output upscaling factor: 2x or 4x."},
-      "color_fix": {"name": "Color Fix", "tooltip": "Apply wavelet color correction to reduce color shifts."},
-      "tiled_vae": {"name": "Tiled VAE", "tooltip": "Decode the VAE in spatial tiles to reduce VRAM usage."},
-      "tiled_dit": {"name": "Tiled DiT", "tooltip": "Process the diffusion transformer in spatial tiles to reduce VRAM usage."},
+      "color_fix": {"name": "Color Fix", "tooltip": "Match decoded colors to the input using the selected correction method."},
+      "fix_method": {"name": "Color Fix Method", "tooltip": "Wavelet is the default and preserves generated high-frequency detail; AdaIN matches per-frame color statistics."},
+      "tiled_vae": {"name": "Tiled VAE", "tooltip": "Use the Full Wan VAE's native tiler to reduce decode VRAM. Tiny modes ignore this option."},
+      "tiled_dit": {"name": "Tiled DiT (Deprecated)", "tooltip": "Kept for workflow compatibility and ignored at runtime because independent DiT tiles reduce quality."},
       "tile_size": {"name": "DiT Tile Size", "tooltip": "Spatial tile size for DiT processing. Smaller tiles use less VRAM but require more passes."},
       "tile_overlap": {"name": "Tile Overlap", "tooltip": "Overlap between tiles used to blend boundaries."},
       "unload_dit": {"name": "Unload DiT", "tooltip": "Unload the DiT before VAE decoding to free VRAM."},
       "sparse_ratio": {"name": "Sparse Ratio", "tooltip": "Sparse attention ratio. Lower values are faster; higher values retain more detail."},
-      "kv_ratio": {"name": "K/V Ratio", "tooltip": "Key/value cache ratio. Lower values use less VRAM."},
-      "local_range": {"name": "Local Range", "tooltip": "Local attention window size."},
+      "kv_ratio": {"name": "K/V Ratio", "tooltip": "Key/value cache ratio from 1.0 to 10.0. The default 3.5 balances temporal context and VRAM usage."},
+      "local_range": {"name": "Local Range", "tooltip": "11 matches the reference ComfyUI node and favors temporal stability; 9 is sharper. Default: 11."},
       "seed": {"name": "Seed", "tooltip": "Random seed used for reproducible noise generation."},
-      "frame_chunk_size": {"name": "Frame Chunk Size", "tooltip": "Process this many frames per chunk. 0 processes all frames at once."},
+      "frame_chunk_size": {"name": "Frame Chunk Size", "tooltip": "External stateless frame chunking is disabled for quality; nonzero values are ignored. Use tiny-long for stateful long-video processing."},
       "enable_debug": {"name": "Debug Logging", "tooltip": "Enable detailed progress, timing, and VRAM logging."},
       "keep_models_on_cpu": {"name": "Keep Models on CPU", "tooltip": "Keep inactive models in CPU RAM to reduce VRAM pressure."},
-      "resize_factor": {"name": "Resize Factor", "tooltip": "Resize input frames before processing. Lower values reduce VRAM usage."}
+      "resize_factor": {"name": "Resize Factor", "tooltip": "Keep at 1.0 for full quality. Lower values discard source detail before super-resolution."}
     },
     "outputs": {
       "0": {"name": "Image", "tooltip": "Upscaled video frames as an IMAGE batch."}
@@ -54,11 +57,11 @@
     "inputs": {
       "model": {"name": "Model", "tooltip": "FlashVSR model version. V1.1 is recommended for stability."},
       "mode": {"name": "Mode", "tooltip": "Processing mode: tiny, tiny-long, or full."},
-      "vae_model": {"name": "VAE Model", "tooltip": "VAE variant used for decoding. Missing VAE files are downloaded automatically."},
+      "vae_model": {"name": "VAE Model", "tooltip": "Full-mode decoder: Wan2.1 for highest fidelity or LightVAE_W2.1 for lower VRAM. Official Wan2.2 uses incompatible 48-channel latents. Tiny modes use TCDecoder."},
       "force_offload": {"name": "Force Offload", "tooltip": "Move models to CPU RAM after execution to free VRAM."},
       "precision": {"name": "Precision", "tooltip": "Inference precision. Auto selects bfloat16 when supported."},
       "device": {"name": "Device", "tooltip": "Computation device. Auto selects the best available device."},
-      "attention_mode": {"name": "Attention Backend", "tooltip": "Select the attention backend. Auto chooses a compatible backend and explicit choices are preserved."}
+      "attention_mode": {"name": "Attention Backend", "tooltip": "Auto prefers a mask-capable backend. Dense Sage/FlashAttention choices accelerate compatible calls; masked self-attention keeps the model topology through masked SDPA when needed."}
     },
     "outputs": {
       "0": {"name": "Pipeline", "tooltip": "Initialized pipeline tuple for the advanced FlashVSR node."}
