@@ -1,0 +1,67 @@
+{
+  "FlashVSRNode": {
+    "display_name": "FlashVSR 超快速",
+    "description": "带显存感知处理的视频超分辨率单节点。",
+    "inputs": {
+      "frames": {"name": "输入帧", "tooltip": "要放大的视频帧，格式为 IMAGE 批次 (N, H, W, C)。"},
+      "model": {"name": "模型", "tooltip": "选择 FlashVSR 模型版本，推荐使用 V1.1 以获得更稳定的结果。"},
+      "mode": {"name": "模式", "tooltip": "处理模式：tiny 更快，tiny-long 针对长视频优化，full 优先保证质量。"},
+      "vae_model": {"name": "VAE 模型", "tooltip": "用于解码的 VAE 变体，缺少的 VAE 文件会自动下载。"},
+      "scale": {"name": "放大倍数", "tooltip": "输出放大倍数：2 倍或 4 倍。"},
+      "tiled_vae": {"name": "分块 VAE", "tooltip": "使用空间分块解码 VAE，以降低显存占用。"},
+      "tiled_dit": {"name": "分块 DiT", "tooltip": "使用空间分块处理扩散 Transformer，以降低显存占用。"},
+      "unload_dit": {"name": "卸载 DiT", "tooltip": "VAE 解码前卸载 DiT，以释放显存。"},
+      "seed": {"name": "随机种子", "tooltip": "用于生成可复现噪声的随机种子。"},
+      "frame_chunk_size": {"name": "帧分块大小", "tooltip": "每次处理的帧数，0 表示一次处理全部帧。"},
+      "attention_mode": {"name": "注意力后端", "tooltip": "选择注意力后端。自动模式会选择兼容后端，手动选择不会被其他已安装后端替换。"},
+      "enable_debug": {"name": "调试日志", "tooltip": "启用详细的进度、耗时和显存日志。"},
+      "keep_models_on_cpu": {"name": "模型保留在 CPU", "tooltip": "将暂时不用的模型保留在 CPU 内存中，以降低显存压力。"},
+      "resize_factor": {"name": "缩放比例", "tooltip": "处理前缩放输入帧，较低的比例可以降低显存占用。"}
+    },
+    "outputs": {
+      "0": {"name": "图像", "tooltip": "放大后的视频帧，格式为 IMAGE 批次。"}
+    }
+  },
+  "FlashVSRNodeAdv": {
+    "display_name": "FlashVSR 超快速（高级）",
+    "description": "提供完整参数控制的 FlashVSR 视频超分辨率节点。",
+    "inputs": {
+      "pipe": {"name": "处理管线", "tooltip": "由 FlashVSR 初始化管线节点创建的管线对象。"},
+      "frames": {"name": "输入帧", "tooltip": "要放大的视频帧，格式为 IMAGE 批次 (N, H, W, C)。"},
+      "scale": {"name": "放大倍数", "tooltip": "输出放大倍数：2 倍或 4 倍。"},
+      "color_fix": {"name": "颜色修正", "tooltip": "应用小波颜色修正，减少输出颜色偏移。"},
+      "tiled_vae": {"name": "分块 VAE", "tooltip": "使用空间分块解码 VAE，以降低显存占用。"},
+      "tiled_dit": {"name": "分块 DiT", "tooltip": "使用空间分块处理扩散 Transformer，以降低显存占用。"},
+      "tile_size": {"name": "DiT 分块大小", "tooltip": "DiT 处理的空间分块大小。更小的分块占用更少显存，但需要更多处理次数。"},
+      "tile_overlap": {"name": "分块重叠", "tooltip": "用于融合分块边界的重叠像素数。"},
+      "unload_dit": {"name": "卸载 DiT", "tooltip": "VAE 解码前卸载 DiT，以释放显存。"},
+      "sparse_ratio": {"name": "稀疏比例", "tooltip": "稀疏注意力比例。较低值更快，较高值保留更多细节。"},
+      "kv_ratio": {"name": "K/V 比例", "tooltip": "键值缓存比例。较低值占用更少显存。"},
+      "local_range": {"name": "局部范围", "tooltip": "局部注意力窗口大小。"},
+      "seed": {"name": "随机种子", "tooltip": "用于生成可复现噪声的随机种子。"},
+      "frame_chunk_size": {"name": "帧分块大小", "tooltip": "每次处理的帧数，0 表示一次处理全部帧。"},
+      "enable_debug": {"name": "调试日志", "tooltip": "启用详细的进度、耗时和显存日志。"},
+      "keep_models_on_cpu": {"name": "模型保留在 CPU", "tooltip": "将暂时不用的模型保留在 CPU 内存中，以降低显存压力。"},
+      "resize_factor": {"name": "缩放比例", "tooltip": "处理前缩放输入帧，较低的比例可以降低显存占用。"}
+    },
+    "outputs": {
+      "0": {"name": "图像", "tooltip": "放大后的视频帧，格式为 IMAGE 批次。"}
+    }
+  },
+  "FlashVSRInitPipe": {
+    "display_name": "FlashVSR 初始化管线",
+    "description": "初始化供高级节点使用的 FlashVSR 处理管线。",
+    "inputs": {
+      "model": {"name": "模型", "tooltip": "选择 FlashVSR 模型版本，推荐使用 V1.1 以获得更稳定的结果。"},
+      "mode": {"name": "模式", "tooltip": "处理模式：tiny、tiny-long 或 full。"},
+      "vae_model": {"name": "VAE 模型", "tooltip": "用于解码的 VAE 变体，缺少的 VAE 文件会自动下载。"},
+      "force_offload": {"name": "强制卸载", "tooltip": "执行完成后将模型移到 CPU 内存，以释放显存。"},
+      "precision": {"name": "精度", "tooltip": "推理精度，自动模式在支持时选择 bfloat16。"},
+      "device": {"name": "设备", "tooltip": "计算设备，自动模式会选择可用的最佳设备。"},
+      "attention_mode": {"name": "注意力后端", "tooltip": "选择注意力后端。自动模式会选择兼容后端，手动选择不会被其他已安装后端替换。"}
+    },
+    "outputs": {
+      "0": {"name": "处理管线", "tooltip": "供 FlashVSR 高级节点使用的已初始化管线元组。"}
+    }
+  }
+}

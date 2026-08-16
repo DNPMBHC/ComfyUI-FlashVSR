@@ -1,9 +1,34 @@
 # Changelog
 
-All notable changes to ComfyUI-FlashVSR_Stable will be documented in this file.
+All notable changes to ComfyUI-FlashVSR will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- Added official ComfyUI node definitions for English and Simplified Chinese under `locales/`.
+
+### Changed
+
+- Updated repository, documentation, issue tracker, CLI, and Comfy Registry metadata for the maintained fork.
+- Replaced the tracked local model-path configuration with `model_paths.yaml.example`; local `model_paths.yaml` files are now ignored.
+- Sanitized the sample workflow by removing machine-specific input/output paths and stale node-source metadata.
+- Removed the stale `node.zip` source snapshot from version control.
+
+### Performance
+
+- Added architecture-aware `auto` attention selection with RTX 50 series support through SageAttention 2.2.
+- Added explicit `sage_attention` and `flash_attention_3` backends while preserving explicit user selection.
+- Added lazy binary-extension loading, version/capability reporting, and chained runtime fallbacks.
+- FlashAttention 3 is restricted to known-compatible Hopper devices unless `FLASHVSR_ENABLE_EXPERIMENTAL_FA3=1` is set.
+
+### Bug Fixes
+
+- Optional attention packages no longer override the node-selected backend merely because they are installed.
+- Broken or incompatible CUDA extensions fall back without being retried for every attention call.
 
 
 ## [1.3.0] - 2026-02-03

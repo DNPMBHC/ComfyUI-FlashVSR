@@ -36,7 +36,7 @@ try:
     from .src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
     from .src.models.TCDecoder import build_tcdecoder
     from .src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
-    from .src.models import wan_video_dit
+    from .src.models.wan_video_dit import ATTENTION_MODES, attention_backend_status
     from .src.models.wan_video_vae import (
         WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae,
         VAE_FULL_DIM, VAE_LIGHT_DIM, VAE_Z_DIM
@@ -45,7 +45,7 @@ except ImportError:
     from src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
     from src.models.TCDecoder import build_tcdecoder
     from src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
-    from src.models import wan_video_dit
+    from src.models.wan_video_dit import ATTENTION_MODES, attention_backend_status
     from src.models.wan_video_vae import (
         WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae,
         VAE_FULL_DIM, VAE_LIGHT_DIM, VAE_Z_DIM
@@ -60,6 +60,7 @@ except ImportError:
 # FIX 1: Unified VAE model selection dropdown - ALL 5 OPTIONS
 # =============================================================================
 VAE_MODEL_OPTIONS = ["Wan2.1", "Wan2.2", "LightVAE_W2.1", "TAE_W2.2", "LightTAE_HY1.5"]
+ATTENTION_MODE_OPTIONS = list(ATTENTION_MODES)
 
 # =============================================================================
 # FIX 2 & 7: STRICT file path mapping with EXPLICIT class instantiation
@@ -764,7 +765,7 @@ def create_feather_mask(size, overlap):
     
     return mask
 
-def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
+def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", attention_mode="auto"):
     """
     Initialize FlashVSR pipeline with specified model and VAE type.
     
@@ -893,6 +894,22 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
         pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
         mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device, weights_only=False), strict=False)
         pipe.TCDecoder.clean_mem()
+
+    effective_attention_mode = pipe.denoising_model().set_attention_mode(attention_mode)
+    pipe.attention_mode = effective_attention_mode
+    if effective_attention_mode != attention_mode:
+        log(
+            f"Attention backend '{attention_mode}' is unavailable; using '{effective_attention_mode}'.",
+            message_type='warning', icon="⚠️")
+    backend_status = attention_backend_status()
+    log(
+        "Attention capabilities: "
+        f"arch={backend_status['cuda_arch']}, "
+        f"Sage={backend_status['sage_attention']['version'] or 'off'}, "
+        f"FA2={'on' if backend_status['flash_attention_2']['available'] else 'off'}, "
+        f"FA3={'on' if backend_status['flash_attention_3']['available'] else 'off'}, "
+        f"BlockSparse={'on' if backend_status['block_sparse_attention']['available'] else 'off'}",
+        message_type='info', icon="🧩")
     
     if model == "FlashVSR":
         pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
@@ -911,7 +928,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     if hasattr(pipe, 'vae') and pipe.vae is not None:
         vae_info += f" ({type(pipe.vae).__name__})"
     
-    log(f"Pipeline Initialized: Mode={mode}, Device={device}, Dtype={dtype}, Attention={wan_video_dit.ATTENTION_MODE}", message_type='info', icon="🔧")
+    log(f"Pipeline Initialized: Mode={mode}, Device={device}, Dtype={dtype}, Attention={effective_attention_mode}", message_type='info', icon="🔧")
     log(f"Model: {model}, {vae_info}", message_type='info', icon="📦")
 
     return pipe
@@ -1402,9 +1419,9 @@ class FlashVSRNodeInitPipe:
                     "default": device_choices[0],
                     "tooltip": "Select the computation device (CUDA GPU, CPU, etc.). 'auto' picks the best available."
                 }),
-                "attention_mode": (["sparse_sage_attention", "block_sparse_attention", "flash_attention_2", "sdpa"], {
-                    "default": "sparse_sage_attention",
-                    "tooltip": 'Attention mechanism backend. "sparse_sage"/"block_sparse" use efficient sparse attention. "flash_attention_2"/"sdpa" use dense attention (slower, more VRAM).'
+                "attention_mode": (ATTENTION_MODE_OPTIONS, {
+                    "default": "auto",
+                    "tooltip": 'Auto selects a GPU-compatible backend. Explicit choices never get replaced by another backend unless initialization or runtime fails.'
                 }),
             }
         }
@@ -1425,8 +1442,6 @@ class FlashVSRNodeInitPipe:
         if _device.startswith("cuda"):
             torch.cuda.set_device(_device)
             
-        wan_video_dit.ATTENTION_MODE = attention_mode
-
         # Auto bfloat16 detection
         if precision == "auto":
             if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
@@ -1447,7 +1462,11 @@ class FlashVSRNodeInitPipe:
             dtype = torch.bfloat16
 
         # Use unified vae_model parameter
-        pipe = init_pipeline(model, mode, _device, dtype, vae_model=vae_model)
+        pipe = init_pipeline(
+            model, mode, _device, dtype,
+            vae_model=vae_model,
+            attention_mode=attention_mode,
+        )
         # FIX 10: Store mode with pipe for unified processing logic
         return((pipe, force_offload, mode),)
 
@@ -1625,9 +1644,9 @@ class FlashVSRNode:
                     "step": 1,
                     "tooltip": "Process video in chunks of N frames to prevent VRAM OOM. 0 = Process all frames at once."
                 }),
-                "attention_mode": (["sparse_sage_attention", "block_sparse_attention", "flash_attention_2", "sdpa"], {
-                    "default": "sparse_sage_attention",
-                    "tooltip": 'Attention mechanism backend. "sparse_sage" is recommended for speed/memory efficiency.'
+                "attention_mode": (ATTENTION_MODE_OPTIONS, {
+                    "default": "auto",
+                    "tooltip": 'Auto selects a GPU-compatible backend. SageAttention is optimized for RTX 50 series; SDPA is the safe fallback.'
                 }),
                 "enable_debug": ("BOOLEAN", {
                     "default": False,
@@ -1661,10 +1680,12 @@ class FlashVSRNode:
         if _device.startswith("cuda"):
             torch.cuda.set_device(_device)
             
-        wan_video_dit.ATTENTION_MODE = attention_mode
-        
         # Use unified vae_model parameter    
-        pipe = init_pipeline(model, mode, _device, torch.float16, vae_model=vae_model)
+        pipe = init_pipeline(
+            model, mode, _device, torch.float16,
+            vae_model=vae_model,
+            attention_mode=attention_mode,
+        )
         # FIX 10: Pass mode for unified processing logic
         output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
         return(output.cpu().float(),)

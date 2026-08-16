@@ -1,0 +1,67 @@
+{
+  "FlashVSRNode": {
+    "display_name": "FlashVSR Ultra-Fast",
+    "description": "Single-node FlashVSR video upscaling with VRAM-aware processing.",
+    "inputs": {
+      "frames": {"name": "Frames", "tooltip": "Input video frames as an IMAGE batch (N, H, W, C)."},
+      "model": {"name": "Model", "tooltip": "FlashVSR model version. V1.1 is recommended for stability."},
+      "mode": {"name": "Mode", "tooltip": "Processing mode: tiny is faster, tiny-long is optimized for long videos, and full prioritizes quality."},
+      "vae_model": {"name": "VAE Model", "tooltip": "VAE variant used for decoding. Missing VAE files are downloaded automatically."},
+      "scale": {"name": "Scale", "tooltip": "Output upscaling factor: 2x or 4x."},
+      "tiled_vae": {"name": "Tiled VAE", "tooltip": "Decode the VAE in spatial tiles to reduce VRAM usage."},
+      "tiled_dit": {"name": "Tiled DiT", "tooltip": "Process the diffusion transformer in spatial tiles to reduce VRAM usage."},
+      "unload_dit": {"name": "Unload DiT", "tooltip": "Unload the DiT before VAE decoding to free VRAM."},
+      "seed": {"name": "Seed", "tooltip": "Random seed used for reproducible noise generation."},
+      "frame_chunk_size": {"name": "Frame Chunk Size", "tooltip": "Process this many frames per chunk. 0 processes all frames at once."},
+      "attention_mode": {"name": "Attention Backend", "tooltip": "Select the attention backend. Auto chooses a compatible backend and explicit choices are preserved."},
+      "enable_debug": {"name": "Debug Logging", "tooltip": "Enable detailed progress, timing, and VRAM logging."},
+      "keep_models_on_cpu": {"name": "Keep Models on CPU", "tooltip": "Keep inactive models in CPU RAM to reduce VRAM pressure."},
+      "resize_factor": {"name": "Resize Factor", "tooltip": "Resize input frames before processing. Lower values reduce VRAM usage."}
+    },
+    "outputs": {
+      "0": {"name": "Image", "tooltip": "Upscaled video frames as an IMAGE batch."}
+    }
+  },
+  "FlashVSRNodeAdv": {
+    "display_name": "FlashVSR Ultra-Fast (Advanced)",
+    "description": "Advanced FlashVSR video upscaling controls.",
+    "inputs": {
+      "pipe": {"name": "Pipeline", "tooltip": "Pipeline object created by the FlashVSR Init Pipeline node."},
+      "frames": {"name": "Frames", "tooltip": "Input video frames as an IMAGE batch (N, H, W, C)."},
+      "scale": {"name": "Scale", "tooltip": "Output upscaling factor: 2x or 4x."},
+      "color_fix": {"name": "Color Fix", "tooltip": "Apply wavelet color correction to reduce color shifts."},
+      "tiled_vae": {"name": "Tiled VAE", "tooltip": "Decode the VAE in spatial tiles to reduce VRAM usage."},
+      "tiled_dit": {"name": "Tiled DiT", "tooltip": "Process the diffusion transformer in spatial tiles to reduce VRAM usage."},
+      "tile_size": {"name": "DiT Tile Size", "tooltip": "Spatial tile size for DiT processing. Smaller tiles use less VRAM but require more passes."},
+      "tile_overlap": {"name": "Tile Overlap", "tooltip": "Overlap between tiles used to blend boundaries."},
+      "unload_dit": {"name": "Unload DiT", "tooltip": "Unload the DiT before VAE decoding to free VRAM."},
+      "sparse_ratio": {"name": "Sparse Ratio", "tooltip": "Sparse attention ratio. Lower values are faster; higher values retain more detail."},
+      "kv_ratio": {"name": "K/V Ratio", "tooltip": "Key/value cache ratio. Lower values use less VRAM."},
+      "local_range": {"name": "Local Range", "tooltip": "Local attention window size."},
+      "seed": {"name": "Seed", "tooltip": "Random seed used for reproducible noise generation."},
+      "frame_chunk_size": {"name": "Frame Chunk Size", "tooltip": "Process this many frames per chunk. 0 processes all frames at once."},
+      "enable_debug": {"name": "Debug Logging", "tooltip": "Enable detailed progress, timing, and VRAM logging."},
+      "keep_models_on_cpu": {"name": "Keep Models on CPU", "tooltip": "Keep inactive models in CPU RAM to reduce VRAM pressure."},
+      "resize_factor": {"name": "Resize Factor", "tooltip": "Resize input frames before processing. Lower values reduce VRAM usage."}
+    },
+    "outputs": {
+      "0": {"name": "Image", "tooltip": "Upscaled video frames as an IMAGE batch."}
+    }
+  },
+  "FlashVSRInitPipe": {
+    "display_name": "FlashVSR Init Pipeline",
+    "description": "Initialize a FlashVSR pipeline for use with the advanced node.",
+    "inputs": {
+      "model": {"name": "Model", "tooltip": "FlashVSR model version. V1.1 is recommended for stability."},
+      "mode": {"name": "Mode", "tooltip": "Processing mode: tiny, tiny-long, or full."},
+      "vae_model": {"name": "VAE Model", "tooltip": "VAE variant used for decoding. Missing VAE files are downloaded automatically."},
+      "force_offload": {"name": "Force Offload", "tooltip": "Move models to CPU RAM after execution to free VRAM."},
+      "precision": {"name": "Precision", "tooltip": "Inference precision. Auto selects bfloat16 when supported."},
+      "device": {"name": "Device", "tooltip": "Computation device. Auto selects the best available device."},
+      "attention_mode": {"name": "Attention Backend", "tooltip": "Select the attention backend. Auto chooses a compatible backend and explicit choices are preserved."}
+    },
+    "outputs": {
+      "0": {"name": "Pipeline", "tooltip": "Initialized pipeline tuple for the advanced FlashVSR node."}
+    }
+  }
+}

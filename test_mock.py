@@ -201,6 +201,7 @@ class TestFlashVSRNodes(unittest.TestCase):
                 num_frames=5,
                 height=64,
                 width=64,
+                cfg_scale=1.0,
                 unload_dit=True,
                 force_offload=True,
                 enable_debug_logging=True

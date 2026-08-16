@@ -1,9 +1,12 @@
 [project]
-name = "ComfyUI-FlashVSR_Stable"
-description = "ComfyUI-FlashVSR_Stable official ComfyUI integration: High-performance Video Super Resolution for ComfyUI with VRAM optimization."
+name = "ComfyUI-FlashVSR"
+description = "ComfyUI integration for FlashVSR video super-resolution with VRAM-aware attention backends."
 version = "1.3.0"
 authors = [
     {name = "naxci1"},
+]
+maintainers = [
+    {name = "DNPMBHC"},
 ]
 license = {file = "LICENSE"} 
 classifiers = [
@@ -11,13 +14,13 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/naxci1/ComfyUI-FlashVSR_Stable"
-Documentation = "https://github.com/naxci1/ComfyUI-FlashVSR_Stable/blob/main/CHANGELOG.md"
-"Bug Tracker" = "https://github.com/naxci1/ComfyUI-FlashVSR_Stable/issues"
-Forum = "https://github.com/naxci1/ComfyUI-FlashVSR_Stable/discussions"
+Repository = "https://github.com/DNPMBHC/ComfyUI-FlashVSR"
+Documentation = "https://github.com/DNPMBHC/ComfyUI-FlashVSR/blob/main/README.md"
+"Bug Tracker" = "https://github.com/DNPMBHC/ComfyUI-FlashVSR/issues"
+Forum = "https://github.com/DNPMBHC/ComfyUI-FlashVSR/discussions"
 
 [tool.comfy]
-PublisherId = "naxci1"
-DisplayName = "ComfyUI-FlashVSR_Stable"
-Icon = "https://github.com/naxci1/ComfyUI-FlashVSR_Stable/raw/main/workflow/logo_tr.png"
+PublisherId = "DNPMBHC"
+DisplayName = "ComfyUI-FlashVSR"
+Icon = "https://github.com/DNPMBHC/ComfyUI-FlashVSR/raw/main/workflow/logo_tr.png"
 includes = []

@@ -52,7 +52,7 @@ Examples:
         --vae_model LightVAE_W2.1 --tiled_vae --tiled_dit \\
         --frame_chunk_size 20 --resize_factor 0.5
 
-For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
+For more information, visit: https://github.com/DNPMBHC/ComfyUI-FlashVSR
 """
     )
 
@@ -123,9 +123,9 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
     parser.add_argument(
         '--attention_mode',
         type=str,
-        choices=['sparse_sage_attention', 'block_sparse_attention', 'flash_attention_2', 'sdpa'],
-        default='sparse_sage_attention',
-        help='Attention mechanism backend. "sparse_sage"/"block_sparse" use efficient sparse attention. "flash_attention_2"/"sdpa" use dense attention. (default: sparse_sage_attention)'
+        choices=['auto', 'sparse_sage_attention', 'sage_attention', 'block_sparse_attention', 'flash_attention_2', 'flash_attention_3', 'sdpa'],
+        default='auto',
+        help='Attention backend. auto selects a GPU-compatible implementation; explicit choices fall back only when unavailable. (default: auto)'
     )
 
     # ==========================================================================
@@ -503,7 +503,6 @@ def main():
         init_pipeline, flashvsr, log,
         VAE_MODEL_OPTIONS, VAE_MODEL_MAP
     )
-    from src.models import wan_video_dit
     
     # ==========================================================================
     # Load input video (Lazily)
@@ -535,9 +534,6 @@ def main():
     # ==========================================================================
     print("\nInitializing FlashVSR pipeline...")
     
-    # Set attention mode
-    wan_video_dit.ATTENTION_MODE = args.attention_mode
-    
     # Determine dtype
     if args.precision == "auto":
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
@@ -561,7 +557,8 @@ def main():
         mode=args.mode,
         device=device,
         dtype=dtype,
-        vae_model=args.vae_model
+        vae_model=args.vae_model,
+        attention_mode=args.attention_mode,
     )
     
     # ==========================================================================

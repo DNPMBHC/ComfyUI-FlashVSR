@@ -1,15 +1,17 @@
-# ComfyUI-FlashVSR_Stable
+# ComfyUI-FlashVSR
 
 **High-performance Video Super Resolution for ComfyUI with VRAM optimization.**
 
 Run FlashVSR on 8GB-24GB+ GPUs without artifacts. Features intelligent resource management, 5 VAE options, and auto-downloading models.
 
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Compatible-green.svg)](https://github.com/comfyanonymous/ComfyUI)
 
 ---
 
-Registry Link: https://registry.comfy.org/publishers/naxci1/nodes/ComfyUI-FlashVSR_Stable
+Maintained fork of [ComfyUI-FlashVSR_Stable](https://github.com/naxci1/ComfyUI-FlashVSR_Stable), published at [github.com/DNPMBHC/ComfyUI-FlashVSR](https://github.com/DNPMBHC/ComfyUI-FlashVSR).
+
+The node interface includes ComfyUI's official `locales/en/nodeDefs.json` and `locales/zh/nodeDefs.json` translations.
 
 ---
 
@@ -42,11 +44,11 @@ This node is optimized for various hardware configurations. Here are some guidel
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **24GB+** | `full` or `tiny` | Disabled | 0 (All) | `bf16`/`auto` | Max quality/speed. |
 | **16GB** | `tiny` | `tiled_vae=True` | 0 or ~100 | `bf16`/`auto` | Enable `keep_models_on_cpu`. |
-| **12GB** | `tiny` | `tiled_vae=True`, `tiled_dit=True` | ~50 | `fp16` | Use `sparse_sage` attention. |
+| **12GB** | `tiny` | `tiled_vae=True`, `tiled_dit=True` | ~50 | `fp16` | Use `auto` or `sage_attention`. |
 | **8GB** | `tiny-long` | **Required** | ~20 | `fp16` | Must use tiling and chunking. |
 
 ### Performance Enhancements
-- **Attention Mode**: Use `sparse_sage_attention` for the best balance of speed and memory. `flash_attention_2` is faster but requires specific hardware/installation.
+- **Attention Mode**: Use `auto` for architecture-aware selection. RTX 50 series prefers SageAttention; Hopper can use FlashAttention 3; FlashAttention 2 and SDPA remain compatible fallbacks.
 - **Precision**: `bf16` (BFloat16) is recommended for RTX 3000/4000/5000 series. It is faster and preserves dynamic range better than `fp16`.
 - **Chunking**: Use `frame_chunk_size` to process videos in segments. This moves processed frames to CPU RAM, preventing VRAM saturation on long clips.
 - **Resize Input**: If the input video is large (e.g., 1080p), use the `resize_factor` parameter to reduce input size to `0.5x` before processing. This drastically reduces VRAM usage and allows for 4x upscaling of the resized result (net 2x output). For small videos, leave at `1.0`.
@@ -191,7 +193,7 @@ Hover over any input in ComfyUI to see tooltips. Full parameter list:
 | **enable_debug** | Verbose console logging. |
 | **keep_models_on_cpu** | Offload to system RAM when idle. |
 | **resize_factor** | To first reduce the size of large videos and then enlarge them, use a range of (0.3-1.0). |
-| **attention_mode** | Attention kernel: `sparse_sage`, `flash_attention_2`, `sdpa`, `block_sparse` |
+| **attention_mode** | Attention kernel: `auto`, `sage_attention`, `sparse_sage_attention`, `flash_attention_2`, `flash_attention_3`, `block_sparse_attention`, `sdpa` |
 
 ---
 
@@ -245,7 +247,7 @@ All arguments map 1:1 with ComfyUI node inputs. Run `python cli_main.py --help` 
 | `--no_force_offload` | flag | - | Disable force offloading |
 | `--precision` | choice | `auto` | Precision: `fp16`, `bf16`, `auto` |
 | `--device` | string | `auto` | Device: `cuda:0`, `cuda:1`, `cpu`, `auto` |
-| `--attention_mode` | choice | `sparse_sage_attention` | Attention: `sparse_sage_attention`, `block_sparse_attention`, `flash_attention_2`, `sdpa` |
+| `--attention_mode` | choice | `auto` | Architecture-aware attention selection with explicit Sage, sparse, FlashAttention 2/3, Block Sparse, and SDPA modes |
 
 #### Processing Parameters (from FlashVSRNodeAdv)
 
@@ -288,8 +290,8 @@ All arguments map 1:1 with ComfyUI node inputs. Run `python cli_main.py --help` 
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git
-python -m pip install -r ComfyUI-FlashVSR_Stable/requirements.txt
+git clone https://github.com/DNPMBHC/ComfyUI-FlashVSR.git
+python -m pip install -r ComfyUI-FlashVSR/requirements.txt
 ```
 
 > 📢 **Turing architecture or older GPUs (GTX 16 series, RTX 20 series, and earlier)**: Install `triton<3.3.0`:
@@ -318,7 +320,7 @@ ComfyUI/models/FlashVSR/
 
 By default, FlashVSR looks for models in `ComfyUI/models/FlashVSR/`. To use a different location (e.g., models on another drive):
 
-1. Edit `model_paths.yaml` in the `ComfyUI-FlashVSR_Stable` directory
+1. Copy `model_paths.yaml.example` to `model_paths.yaml` in the `ComfyUI-FlashVSR` directory
 2. Set `flashvsr_model_path` to your custom path
 3. Restart ComfyUI
 
@@ -374,4 +376,4 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 
 ## 📄 License
 
-MIT License - see [LICENSE](LICENSE) for details.
+GPLv3 License - see [LICENSE](LICENSE) for details. Components under `src/` retain their original Apache-2.0 licensing where applicable.

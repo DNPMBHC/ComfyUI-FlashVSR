@@ -6,10 +6,14 @@ safetensors
 tqdm
 pillow
 huggingface_hub
+# Install a Triton build compatible with the installed PyTorch/CUDA runtime.
 triton; platform_system!="Windows"
 triton-windows; platform_system=="Windows"
+# Optional accelerator backends are selected at runtime when installed.
 sageattention
-flash-attn --no-build-isolation; platform_system!="Windows"
+flash-attn; platform_system!="Windows"
+# block-sparse-attn and FlashAttention 3 are distributed as platform-specific
+# wheels; install a matching wheel separately when the target GPU supports it.
 psutil
 opencv-python>=4.8.1.78
 pyyaml
