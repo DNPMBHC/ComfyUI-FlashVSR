@@ -707,6 +707,7 @@ def model_fn_wan_video(
                 if lq.device != x.device:
                     lq = lq.to(x.device)
                 x = x + lq
+                del lq  # release local reference so GPU copy can be GC'd
             x, last_pre_cache_k, last_pre_cache_v = block(
                 x, context, t_mod, freqs, f, h, w,
                 local_num, topk,

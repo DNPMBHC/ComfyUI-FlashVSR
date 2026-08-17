@@ -598,17 +598,25 @@ class FlashVSRFullPipeline(BasePipeline):
             # segments rather than the full video.
             frame_segments = []
             seg_idx = 0
+            lq_frame_offset = 0
             while seg_idx < len(latents_total):
                 batch_segs = latents_total[seg_idx:seg_idx + 4]
                 latents_batch = torch.cat(batch_segs, dim=2).to(
                     device=self.device,
                     dtype=self.torch_dtype,
                 )
-                frame_start = seg_idx * 8
-                frame_end = min(frame_start + len(batch_segs) * 8, LQ_cur_idx)
+
+                # Pre-slice LQ cond for this batch of latent segments.
+                # Each latent segment produces 8 output frames (2 latent
+                # frames each), except the first which produces 21 (6
+                # latent frames).  We compute the expected output frame
+                # count from the latent frame count.
+                latent_frames_in_batch = sum(s.shape[2] for s in batch_segs)
+                expected_out_frames = latent_frames_in_batch * 4 - 3
                 cond_batch = None
                 if LQ_video is not None:
-                    cond_batch = LQ_video[:, :, frame_start:frame_end].to(
+                    cond_end = min(lq_frame_offset + expected_out_frames, LQ_cur_idx)
+                    cond_batch = LQ_video[:, :, lq_frame_offset:cond_end].to(
                         device=self.device,
                         dtype=latents_batch.dtype,
                     )
@@ -621,6 +629,10 @@ class FlashVSRFullPipeline(BasePipeline):
                     tile_stride=tile_stride,
                     decoder_mode=self.decoder_mode,
                 )
+
+                # Update offset by actual decoded frames (may differ slightly)
+                actual_frames = seg_frames.shape[2]
+                lq_frame_offset += actual_frames
 
                 try:
                     seg_frames = self._apply_color_fix(
