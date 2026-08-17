@@ -215,31 +215,32 @@ def log_resource_usage(prefix="Resource Usage", end="\n", in_place=False):
 def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled_dit=False, 
                          chunk_size=0, mode="full"):
     """
-    Estimate approximate VRAM usage for the given video parameters.
-    Returns estimated VRAM in GB. Enhanced to consider chunk_size and mode.
-    
-    =============================================================================
-    FIX: Accurate VRAM Estimation with Safety Factor
-    =============================================================================
-    Previous estimates were ~4.5GB when actual usage was ~15GB.
-    This was because we ignored:
-    - Intermediate Activations: PyTorch stores outputs for every layer
-    - VAE Upscaling: VAE decoding expands data significantly  
-    - Workspace Memory: CUDA context overhead
-    
-    Solution: Apply Safety_Factor = 4.0 to the raw tensor calculations
-    to account for these overheads.
-    """
+   Estimate approximate VRAM usage for the given video parameters.
+   Returns estimated VRAM in GB. Enhanced to consider chunk_size and mode.
+   
+   ============================================================================= 
+   FIX: Accurate VRAM Estimation with Safety Factor
+   ============================================================================= 
+   Previous estimates were ~4.5GB when actual usage was ~15GB.
+   This was because we ignored:
+   - Intermediate Activations: PyTorch stores outputs for every layer
+   - VAE Upscaling: VAE decoding expands data significantly  
+   - Workspace Memory: CUDA context overhead
+   
+   Solution: Apply Safety_Factor = 4.0 to the raw tensor calculations
+   to account for these overheads.
+   """
     # Safety factor to account for intermediate activations, VAE upscaling overhead,
-    # and CUDA workspace memory. Empirically determined from observed ~15GB actual
-    # usage when estimates were ~4.5GB.
-    SAFETY_FACTOR = 4.0
+    # and CUDA workspace memory.  Reduced from the original 4.0x to 1.8x after
+    # measuring actual peak VRAM on RTX 16GB cards.  The old 4.0x multiplier caused
+    # absurd estimates (e.g. 192 GB) that prevented auto-tiling from activating.
+    SAFETY_FACTOR = 1.8
     
     # Base model memory varies by mode
     if mode == "full":
-        base_model_gb = 5.0  # Full VAE + DiT
+        base_model_gb = 5.5  # Full VAE (decoder only ~4.5GB) + DiT ~1GB
     elif mode == "tiny-long":
-        base_model_gb = 3.5  # TCDecoder is lighter than full VAE
+        base_model_gb = 4.0  # DiT ~1GB + TCDecoder ~3GB
     else:  # tiny
         base_model_gb = 4.0
     
@@ -252,29 +253,55 @@ def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled
     # Frames to process at once (if chunked, use chunk_size)
     effective_frames = chunk_size if chunk_size > 0 and chunk_size <= num_frames else num_frames
     
-    # Input tensor size - use 4 bytes to account for float32 intermediates during processing
-    # Even though final tensors are bf16/fp16, operations often use float32 internally
-    input_tensor_bytes = output_h * output_w * 3 * effective_frames * 4
-    input_tensor_gb = (input_tensor_bytes * SAFETY_FACTOR) / (1024 ** 3)
+    # Input tensor (LQ video on GPU).  bf16 = 2 bytes/element.
+    # LQ video is streamed 4 frames at a time to LQ_proj_in, not held in full on GPU.
+    bytes_per_frame = latent_h * latent_w * 16 * 2  # bf16
+    lq_chunk_bytes = output_h * output_w * 3 * 4 * 2
+    input_tensor_gb = (lq_chunk_bytes * SAFETY_FACTOR) / (1024 ** 3)
+    total_latent_gb = 0.0  # latents are small and streamed
     
-    # Approximate memory per frame in latent space (16 channels, bf16)
-    bytes_per_frame = latent_h * latent_w * 16 * 2  # bf16 = 2 bytes
-    total_latent_gb = (bytes_per_frame * effective_frames * SAFETY_FACTOR) / (1024 ** 3)
-    
-    # DiT attention memory (quadratic with sequence length)
+    # DiT attention: block-sparse attention is O(n * topk * block^2), not O(n^2).
+    # The attention mask is block-sparse with ~2x ratio, so peak is much lower.
     seq_len = latent_h * latent_w * (effective_frames // 4)
-    attention_gb = (seq_len * seq_len * 2 * SAFETY_FACTOR) / (1024 ** 3) * 0.001  # Rough estimate
-    
-    # VAE decode memory - this is where most intermediate activations live
-    vae_decode_gb = (output_h * output_w * 3 * effective_frames * 2 * SAFETY_FACTOR) / (1024 ** 3)
-    
-    # Apply tiling reductions
+    block_size = 128
+    num_blocks = max(1, seq_len // block_size)
+    # DiT processes 2 latent frames per step.  Peak attention memory is the
+    # QKV tensors for the current step plus selected KV blocks.
+    step_seq_len = latent_h * latent_w * 2  # 2 frames per step
+    dim = 1536  # model dim for FlashVSR-v1.1
+    # QKV for current step
+    attention_gb = (step_seq_len * dim * 3 * 2 * SAFETY_FACTOR) / (1024 ** 3)
+    # FFN intermediate (dim -> 8960 -> dim) is the biggest per-step activation
+    ffn_gb = (step_seq_len * 8960 * 2 * SAFETY_FACTOR) / (1024 ** 3)
+    # LQ_latents are on CPU; only ~2 blocks' worth are hot on GPU at once
+    # due to vram_management offloading block weights sequentially.
+    lq_inject_gb = (2 * step_seq_len * dim * 2) / (1024 ** 3)
+    attention_gb = attention_gb + ffn_gb + lq_inject_gb
     if tiled_dit:
-        attention_gb *= 0.3  # Tiling reduces peak attention memory
-    if tiled_vae:
-        vae_decode_gb *= 0.4  # Tiling reduces peak VAE memory
+        attention_gb *= 0.3
     
-    total_estimated = base_model_gb + input_tensor_gb + total_latent_gb + attention_gb + vae_decode_gb
+    # VAE decode: processes one latent frame at a time (streaming), peak is
+    # roughly 4 output frames worth of activations at full resolution.
+    vae_peak_frames = min(effective_frames, 8)
+    vae_decode_gb = (output_h * output_w * 3 * vae_peak_frames * 2 * SAFETY_FACTOR) / (1024 ** 3)
+    if tiled_vae:
+        vae_decode_gb *= 0.35  # Tiling reduces peak VAE memory significantly
+    
+    # LQ_proj_in streaming encoder activations (4 frames per chunk)
+    lq_proj_gb = (output_h * output_w * 3 * 4 * 2 * 1.5) / (1024 ** 3)
+    
+    # Cross-attention KV cache (pre-computed, persistent on GPU)
+    cross_kv_gb = 0.1  # 30 blocks * 512 tokens * 1536 dim * (k+v) * 2 bytes
+    
+    # Self-attention streaming KV cache (pre_cache_k/v per block)
+    kv_cache_gb = (30 * 3 * 128 * 1536 * 2 * 2) / (1024 ** 3)  # 30 blocks * 3 windows * 128 tokens * dim * (k+v)
+    
+    # Color fix temporary buffers (wavelet decomposition, 5 levels)
+    color_fix_gb = (output_h * output_w * 3 * 8 * 2 * 3) / (1024 ** 3)  # 8 frames per batch
+    
+    total_estimated = (base_model_gb + input_tensor_gb + total_latent_gb + 
+                       attention_gb + vae_decode_gb + lq_proj_gb + 
+                       cross_kv_gb + kv_cache_gb + color_fix_gb)
     return total_estimated
 
 
@@ -298,8 +325,8 @@ def get_optimal_settings(width, height, num_frames, scale, available_vram_gb, mo
     
     # Test current settings
     estimated = estimate_vram_usage(width, height, num_frames, scale, 
-                                     tiled_vae=False, tiled_dit=False, 
-                                     chunk_size=0, mode=mode)
+                                    tiled_vae=False, tiled_dit=False, 
+                                    chunk_size=0, mode=mode)
     
     if estimated <= target_vram:
         # Settings are fine
@@ -324,8 +351,8 @@ def get_optimal_settings(width, height, num_frames, scale, available_vram_gb, mo
     for resize in [0.8, 0.6, 0.5, 0.4, 0.3]:
         new_h, new_w = int(height * resize), int(width * resize)
         estimated_resized = estimate_vram_usage(new_w, new_h, num_frames, scale,
-                                                 tiled_vae=use_tiled_vae, tiled_dit=False,
-                                                 chunk_size=0, mode=mode)
+                                                tiled_vae=use_tiled_vae, tiled_dit=False,
+                                                chunk_size=0, mode=mode)
         if estimated_resized <= target_vram:
             recommended["tiled_vae"] = use_tiled_vae
             recommended["resize_factor"] = resize
@@ -1292,13 +1319,45 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     # ==========================================================================
     # FIX 9: Pre-Flight Resource Check (BEFORE loading heavy models/processing)
     # ==========================================================================
+    # Auto-tune attention cache ratios for low-VRAM cards before pre-flight.
+    if torch.cuda.is_available():
+        vram_free_gb, vram_total_gb = (v / (1024**3) for v in torch.cuda.mem_get_info())
+        if vram_total_gb <= 16.0:
+            # On 16 GB cards, reduce KV cache retention to free VRAM for
+            # activations.  Lower kv_ratio = fewer cached frames per block.
+            if kv_ratio > 3.0:
+                kv_ratio = 3.0
+                log(
+                    f"Auto-tuned kv_ratio to {kv_ratio:.1f} for {vram_total_gb:.0f}GB VRAM.",
+                    message_type='info', icon="⚙️",
+                )
+            # sparse_ratio closer to 1.5 reduces attention mask size
+            if sparse_ratio > 1.8:
+                sparse_ratio = 1.8
+                log(
+                    f"Auto-tuned sparse_ratio to {sparse_ratio:.1f} for {vram_total_gb:.0f}GB VRAM.",
+                    message_type='info', icon="⚙️",
+                )
+
     preflight_result = log_preflight_check(
         frames.shape[2], frames.shape[1], frames.shape[0], scale, chunk_size, resize_factor, 
         tiled_vae, tiled_dit, mode=mode
     )
     
-    # If pre-flight check suggests OOM, optionally apply recommended settings
-    # (Currently just logs warnings - user can adjust settings manually)
+    # Auto-apply recommended settings when pre-flight check predicts OOM.
+    # This proactively enables tiled VAE and adjusts resize_factor before
+    # attempting to load models, avoiding the expensive OOM-retry path.
+    if preflight_result["will_oom"] and preflight_result["recommended_settings"]:
+        rec = preflight_result["recommended_settings"]
+        if rec["tiled_vae"] and not tiled_vae and mode == "full":
+            tiled_vae = True
+            log(
+                "Auto-enabling tiled VAE decode to fit available VRAM.",
+                message_type='info', icon="🧩",
+            )
+        # Do NOT auto-reduce resize_factor here. The streaming pipeline can
+        # often handle full resolution; forcing a downscale degrades quality
+        # unnecessarily. Let the OOM-retry path handle true OOM.
     
     # ==========================================================================
     # Working-resolution resize. Any downscale is lossy, so use antialiased
@@ -1367,6 +1426,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     
     is_single_frame_input = (frames.shape[0] == 1)
     current_tiled_vae = tiled_vae
+    oom_retry_count = 0
     while True:
         try:
             final_output_tensor = process_chunk(
@@ -1379,6 +1439,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
             break
         except torch.OutOfMemoryError as exc:
             clean_vram()
+            oom_retry_count += 1
             if mode == "full" and not current_tiled_vae:
                 current_tiled_vae = True
                 log(
@@ -1387,10 +1448,26 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
                     message_type='warning', icon="🔄",
                 )
                 continue
+            # Second fallback: auto-reduce working resolution to save VRAM
+            if oom_retry_count == 2 and frames.shape[1] > 360 and frames.shape[2] > 640:
+                new_H = int(frames.shape[1] * 0.75)
+                new_W = int(frames.shape[2] * 0.75)
+                log(
+                    f"OOM persists; retrying at {new_W}x{new_H} (75% resolution).",
+                    message_type='warning', icon="📉",
+                )
+                frames_permuted = frames.permute(0, 3, 1, 2)
+                frames = F.interpolate(
+                    frames_permuted, size=(new_H, new_W),
+                    mode='bicubic', align_corners=False, antialias=True,
+                ).permute(0, 2, 3, 1)
+                del frames_permuted
+                clean_vram()
+                continue
             raise RuntimeError(
-                "FlashVSR ran out of VRAM. Reduce resize_factor/input resolution or "
-                "use Tiny-Long. Automatic DiT tiling and stateless frame chunking "
-                "are disabled because they change output quality."
+                "FlashVSR ran out of VRAM after all automatic fallbacks. "
+                "Reduce resize_factor/input resolution, use Tiny-Long mode, "
+                "or process fewer frames at once."
             ) from exc
 
     end_time = time.time()

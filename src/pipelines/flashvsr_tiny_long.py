@@ -312,10 +312,10 @@ class FlashVSRTinyLongPipeline(BasePipeline):
 
         use_first_frame_pad = fix_method == "wavelet" if pad_first_frame is None else bool(pad_first_frame)
         target_device = self.device
-        frames = frames.detach().to("cpu", dtype=torch.float32).to(target_device)
+        frames = frames.detach().to(target_device, dtype=self.torch_dtype)
         lq_frames = lq_video[:, :, :frames.shape[2]].detach().to(
-            "cpu", dtype=torch.float32
-        ).to(target_device)
+            target_device, dtype=self.torch_dtype
+        )
         if lq_frames.shape != frames.shape:
             raise ValueError(
                 f"Color-fix shape mismatch: decoded={tuple(frames.shape)}, LQ={tuple(lq_frames.shape)}"
@@ -328,12 +328,13 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         frames = self.ColorCorrector(
             frames,
             lq_frames,
-            clip_range=(-1, 1),
+            clip_range=(-1.0, 1.0),
             chunk_size=chunk_size,
             method=fix_method,
         )
         if use_first_frame_pad:
             frames = frames[:, :, 1:]
+        frames = frames.to("cpu", dtype=self.torch_dtype)
         return frames
     
     def offload_model(self, keep_vae=False):
@@ -450,7 +451,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                             LQ_latents = cur
                         else:
                             for layer_idx in range(len(LQ_latents)):
-                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
+                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1).to("cpu")
                     LQ_cur_idx = (inner_loop_num-1)*4-3
                     cur_latents = latents[:, :, :6, :, :]
                 else:
@@ -466,7 +467,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                             LQ_latents = cur
                         else:
                             for layer_idx in range(len(LQ_latents)):
-                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
+                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1).to("cpu")
                     LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
                         
@@ -501,10 +502,18 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                 ))
                 LQ_pre_idx = LQ_cur_idx
                 del noise_pred_posi, cur_latents
-                
+
                 if unload_dit:
                     clean_vram()
-                    
+                elif cur_process_idx % 8 == 7:
+                    clean_vram()
+                # Free LQ_latents immediately after DiT step
+                if LQ_latents is not None:
+                    for layer_idx in range(len(LQ_latents)):
+                        LQ_latents[layer_idx] = None
+                    LQ_latents = None
+                    clean_vram()
+
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
                 
@@ -693,7 +702,10 @@ def model_fn_wan_video(
     else:
         for block_id, block in enumerate(dit.blocks):
             if LQ_latents is not None and block_id < len(LQ_latents):
-                x = x + LQ_latents[block_id]
+                lq = LQ_latents[block_id]
+                if lq.device != x.device:
+                    lq = lq.to(x.device)
+                x = x + lq
             x, last_pre_cache_k, last_pre_cache_v = block(
                 x, context, t_mod, freqs, f, h, w,
                 local_num, topk,

@@ -371,10 +371,12 @@ class FlashVSRFullPipeline(BasePipeline):
 
         use_first_frame_pad = fix_method == "wavelet" if pad_first_frame is None else bool(pad_first_frame)
         target_device = self.device
-        frames = frames.detach().to("cpu", dtype=torch.float32).to(target_device)
+        # Stay on-device in bf16 to avoid the costly CPU float32 round-trip.
+        # Wavelet and AdaIN are numerically stable in bf16 for color correction.
+        frames = frames.detach().to(target_device, dtype=self.torch_dtype)
         lq_frames = lq_video[:, :, :frames.shape[2]].detach().to(
-            "cpu", dtype=torch.float32
-        ).to(target_device)
+            target_device, dtype=self.torch_dtype
+        )
         if lq_frames.shape != frames.shape:
             raise ValueError(
                 f"Color-fix shape mismatch: decoded={tuple(frames.shape)}, LQ={tuple(lq_frames.shape)}"
@@ -387,12 +389,13 @@ class FlashVSRFullPipeline(BasePipeline):
         frames = self.ColorCorrector(
             frames,
             lq_frames,
-            clip_range=(-1, 1),
+            clip_range=(-1.0, 1.0),
             chunk_size=chunk_size,
             method=fix_method,
         )
         if use_first_frame_pad:
             frames = frames[:, :, 1:]
+        frames = frames.to("cpu", dtype=self.torch_dtype)
         return frames
 
     def offload_model(self, keep_vae=False):
@@ -515,7 +518,7 @@ class FlashVSRFullPipeline(BasePipeline):
                             LQ_latents = cur
                         else:
                             for layer_idx in range(len(LQ_latents)):
-                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
+                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1).to("cpu")
                     LQ_cur_idx = (inner_loop_num-1)*4-3  # = 21 for inner_loop_num=7
                     cur_latents = latents[:, :, :6, :, :]
                 else:
@@ -531,7 +534,7 @@ class FlashVSRFullPipeline(BasePipeline):
                             LQ_latents = cur
                         else:
                             for layer_idx in range(len(LQ_latents)):
-                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
+                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1).to("cpu")
                     LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
 
@@ -565,6 +568,16 @@ class FlashVSRFullPipeline(BasePipeline):
                 
                 if unload_dit:
                     clean_vram()
+                elif cur_process_idx % 8 == 7:
+                    # Periodic cache cleanup during DiT streaming to prevent
+                    # fragmentation from accumulating across many segments.
+                    clean_vram()
+                # Free LQ_latents immediately after DiT step
+                if LQ_latents is not None:
+                    for layer_idx in range(len(LQ_latents)):
+                        LQ_latents[layer_idx] = None
+                    LQ_latents = None
+                    clean_vram()
 
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
@@ -580,39 +593,61 @@ class FlashVSRFullPipeline(BasePipeline):
                 self.dit.to("cpu")
             clean_vram()
 
-            latents = torch.cat(latents_total, dim=2).to(
-                device=self.device,
-                dtype=self.torch_dtype,
-            )
-            cond_frames = None if LQ_video is None else LQ_video[:, :, :LQ_cur_idx].to(
-                device=self.device, dtype=latents.dtype
-            )
-            frames = self.decode_video(
-                latents,
-                cond=cond_frames,
-                tiled=tiled,
-                tile_size=tile_size,
-                tile_stride=tile_stride,
-                decoder_mode=self.decoder_mode,
-            )
-
-            try:
-                frames = self._apply_color_fix(
-                    frames,
-                    cond_frames,
-                    color_fix=color_fix,
-                    fix_method=fix_method,
-                    chunk_size=color_fix_chunk_size,
-                    pad_first_frame=pad_first_frame,
+            # Stream VAE decode in small batches instead of concatenating all
+            # latents first.  This keeps peak VRAM proportional to a few
+            # segments rather than the full video.
+            frame_segments = []
+            seg_idx = 0
+            while seg_idx < len(latents_total):
+                batch_segs = latents_total[seg_idx:seg_idx + 4]
+                latents_batch = torch.cat(batch_segs, dim=2).to(
+                    device=self.device,
+                    dtype=self.torch_dtype,
                 )
-            except Exception as exc:
-                print(f"FlashVSR Full color correction failed; returning uncorrected frames: {exc}")
+                frame_start = seg_idx * 8
+                frame_end = min(frame_start + len(batch_segs) * 8, LQ_cur_idx)
+                cond_batch = None
+                if LQ_video is not None:
+                    cond_batch = LQ_video[:, :, frame_start:frame_end].to(
+                        device=self.device,
+                        dtype=latents_batch.dtype,
+                    )
+
+                seg_frames = self.decode_video(
+                    latents_batch,
+                    cond=cond_batch,
+                    tiled=tiled,
+                    tile_size=tile_size,
+                    tile_stride=tile_stride,
+                    decoder_mode=self.decoder_mode,
+                )
+
+                try:
+                    seg_frames = self._apply_color_fix(
+                        seg_frames,
+                        cond_batch,
+                        color_fix=color_fix,
+                        fix_method=fix_method,
+                        chunk_size=color_fix_chunk_size,
+                        pad_first_frame=pad_first_frame,
+                    )
+                except Exception as exc:
+                    print(f"FlashVSR Full color correction failed for segment {seg_idx}; returning uncorrected: {exc}")
+
+                frame_segments.append(seg_frames)
+                del latents_batch, cond_batch, seg_frames
+                # Free processed latent segments from CPU memory
+                for i in range(seg_idx, min(seg_idx + 4, len(latents_total))):
+                    latents_total[i] = None
+                clean_vram()
+                seg_idx += 4
 
             if self.TCDecoder is not None:
                 self.TCDecoder.clean_mem()
             if force_offload:
                 self.offload_model()
 
+        frames = torch.cat(frame_segments, dim=2)
         return frames[0]
 
 
@@ -738,7 +773,13 @@ def model_fn_wan_video(
     else:
         for block_id, block in enumerate(dit.blocks):
             if LQ_latents is not None and block_id < len(LQ_latents):
-                x = x + LQ_latents[block_id]
+                lq = LQ_latents[block_id]
+                if lq.device != x.device:
+                    lq = lq.to(x.device)
+                x = x + lq
+                # Free the per-block LQ latent if it was moved to GPU
+                if lq.device != x.device:
+                    del lq
             x, last_pre_cache_k, last_pre_cache_v = block(
                 x, context, t_mod, freqs, f, h, w,
                 local_num, topk,
