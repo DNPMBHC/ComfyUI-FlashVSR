@@ -515,10 +515,10 @@ class FlashVSRFullPipeline(BasePipeline):
                         if cur is None:
                             continue
                         if LQ_latents is None:
-                            LQ_latents = cur
+                            LQ_latents = [c.cpu() for c in cur]
                         else:
                             for layer_idx in range(len(LQ_latents)):
-                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1).to("cpu")
+                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx].cpu()], dim=1)
                     LQ_cur_idx = (inner_loop_num-1)*4-3  # = 21 for inner_loop_num=7
                     cur_latents = latents[:, :, :6, :, :]
                 else:
@@ -531,10 +531,10 @@ class FlashVSRFullPipeline(BasePipeline):
                         if cur is None:
                             continue
                         if LQ_latents is None:
-                            LQ_latents = cur
+                            LQ_latents = [c.cpu() for c in cur]
                         else:
                             for layer_idx in range(len(LQ_latents)):
-                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1).to("cpu")
+                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx].cpu()], dim=1)
                     LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
 
